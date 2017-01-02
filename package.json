@@ -1,0 +1,26 @@
+{
+  "name": "floq-timebot",
+  "version": "1.0.0",
+  "description": "Slack bot that notifies people about missing time entries",
+  "main": "index.js",
+  "repository": "git@github.com:blankoslo/floq-timebot.git",
+  "author": "Erlend Hamberg",
+  "license": "Unlicenced",
+  "scripts": {
+    "lint": "eslint ."
+  },
+  "dependencies": {
+    "@slack/client": "^3.8.1",
+    "date-fns": "^1.22.0",
+    "jsonwebtoken": "^7.2.1",
+    "request": "^2.79.0",
+    "request-promise-native": "^1.0.3"
+  },
+  "devDependencies": {
+    "babel-eslint": "^7.1.1",
+    "eslint": "^3.12.2",
+    "eslint-config-walmart": "^1.1.0",
+    "eslint-plugin-filenames": "^1.1.0",
+    "flow-bin": "^0.37.4"
+  }
+}

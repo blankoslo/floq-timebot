@@ -1,0 +1,12 @@
+{
+  "extends": "walmart",
+  "rules": {
+    "arrow-parens": 0,
+    "camelcase": 0,
+    "comma-dangle": 0,
+    "id-length": 0,
+    "no-extra-parens": 0,
+    "quotes": ["error", "single"],
+    "radix": 0,
+  }
+}
