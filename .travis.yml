@@ -17,7 +17,7 @@ before_install:
 script:
 - yarn flow
 - yarn lint
-- openssl aes-256-cbc -K $encrypted_129cbaf6d0a3_key -iv $encrypted_129cbaf6d0a3_iv
+- openssl aes-256-cbc -K $encrypted_cfd811b69347_key -iv $encrypted_cfd811b69347_iv
   -in deployment/client-secret.json.enc -out client-secret.json -d
 - deployment/setup_gcloud
 after_success:
