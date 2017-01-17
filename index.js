@@ -14,11 +14,11 @@ const startDate = subWeeks(new Date(), 1);
 const endDate = subDays(new Date(), 1);
 
 const nbDays = {
-  1: 'én dag',
-  2: 'to dager',
-  3: 'tre dager',
-  4: 'fire dager',
-  5: 'fem dager'
+  '1': 'én dag',
+  '2': 'to dager',
+  '3': 'tre dager',
+  '4': 'fire dager',
+  '5': 'fem dager'
 };
 
 const greetings = [
@@ -33,7 +33,7 @@ const greetings = [
   'Tjena!'
 ];
 
-async function notifySlakcers() {
+const notifySlakcers = async () => {
   const apiToken = jwt.sign({role: 'root'}, process.env.API_JWT_SECRET || 'dev-secret-shhh');
 
   const notifiees = await request({
@@ -52,7 +52,7 @@ async function notifySlakcers() {
 
   const {members: slackUsers} = await slack.users.list();
 
-  for (let {email, unregistered_days: days} of notifiees) {
+  for (const {email, unregistered_days: days} of notifiees) {
     const targetUser = slackUsers.find(u => u.profile.email === email);
 
     if (targetUser === undefined) {
@@ -69,9 +69,9 @@ async function notifySlakcers() {
       console.log(message);
 
       slack.chat.postMessage(`@${targetUser.name}`, message, {as_user: true})
-        .then(_ => console.log(`Message sent to ${targetUser.name}`));
+        .then(console.log(`Message sent to ${targetUser.name}`));
     }
   }
-}
+};
 
 notifySlakcers();
