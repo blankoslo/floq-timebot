@@ -8,7 +8,7 @@
   "license": "Unlicenced",
   "scripts": {
     "lint": "eslint .",
-    "check": "flow check"
+    "flow": "flow check"
   },
   "dependencies": {
     "@slack/client": "^3.8.1",
