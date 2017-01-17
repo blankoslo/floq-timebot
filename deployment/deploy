@@ -1,0 +1,29 @@
+#!/bin/bash
+
+set -e
+set -x
+
+if [ "$TRAVIS_BRANCH" == "develop" ] || [ "$TRAVIS_BRANCH" == "feature/travis-support" ]; then
+  ENV=test;
+elif [ "$TRAVIS_PULL_REQUEST" == false ] && [ "$TRAVIS_BRANCH" == "master" ]; then
+  ENV=prod;
+else
+  unset ENV;
+fi
+
+export GOOGLE_APPLICATION_CREDENTIALS="${PWD}/client-secret.json";
+export PATH=${HOME}/google-cloud-sdk/bin:$PATH
+IMAGE_NAME="eu.gcr.io/marine-cycle-97212/floq-timebot"
+
+if ! [ -z "$ENV" ]; then
+  TAG="$ENV-$TRAVIS_COMMIT";
+  gcloud auth activate-service-account --key-file client-secret.json
+  docker tag floq-timebot "$IMAGE_NAME:$TAG"
+  gcloud docker -- push "$IMAGE_NAME:$TAG"
+  docker tag floq-timebot "$IMAGE_NAME:$ENV"
+  gcloud docker -- push "$IMAGE_NAME:$ENV"
+  "$HOME/google-cloud-sdk/bin/kubectl" \
+    set image deployment/floq-timebot \
+    --namespace=floq-blank-$ENV \
+    "floq-timebot=$IMAGE_NAME:$TAG"
+fi
