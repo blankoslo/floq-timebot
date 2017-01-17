@@ -37,7 +37,7 @@ const notifySlakcers = async () => {
   const apiToken = jwt.sign({role: 'root'}, process.env.API_JWT_SECRET || 'dev-secret-shhh');
 
   const notifiees = await request({
-    uri: 'https://api-blank.floq.no/rpc/time_tracking_status',
+    uri: 'http://floq-reports-api/rpc/time_tracking_status',
     method: 'POST',
     json: true,
     headers: {
