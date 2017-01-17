@@ -7,7 +7,8 @@
   "author": "Erlend Hamberg",
   "license": "Unlicenced",
   "scripts": {
-    "lint": "eslint ."
+    "lint": "eslint .",
+    "check": "flow check"
   },
   "dependencies": {
     "@slack/client": "^3.8.1",
