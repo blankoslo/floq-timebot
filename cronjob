@@ -1,1 +1,1 @@
-0 8 * * * node --harmony-async-await /timebot/index.js >> /var/log/cron.log 2>&1
+0 8 * * 1 node --harmony-async-await /timebot/index.js >> /var/log/cron.log 2>&1
