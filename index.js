@@ -64,8 +64,8 @@ const notifySlakcers = async () => {
 
       const message = `${greeting} Det ser ut som De har glemt å føre ${nbDays[days]} sist uke`
             + ` (mellom ${firstDate} og ${lastDate}). Hvis du avspaserte: ignorer meg. 😳\n\n`
-            + `Timeføring: https://inni.blank.no/timestamp/\n\n`
-            + `P.S: Hvis jeg er veldig teit nå, kontakt @eh. 😇`
+            + 'Timeføring: https://inni.blank.no/timestamp/\n\n'
+            + 'P.S: Hvis jeg er veldig teit nå, kontakt @eh. 😇';
 
       console.log(`Notifying user @${targetUser.name} that s/he is missing ${days} day(s).`);
       console.log(message);
