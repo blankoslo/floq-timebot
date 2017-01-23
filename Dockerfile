@@ -13,4 +13,4 @@ COPY index.js /timebot/index.js
 # CMD [ "node", "--harmony-async-await", "index.js" ]
 
 COPY cronjob /var/spool/cron/crontabs/root
-CMD crond -l 2 -f
+CMD crond -f -L /var/log/crond.log
