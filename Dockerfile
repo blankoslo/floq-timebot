@@ -1,4 +1,4 @@
-FROM mhart/alpine-node
+FROM mhart/alpine-node:8
 
 # Required ENV variables:
 # - API_JWT_SECRET (secret shared with floq-api)
