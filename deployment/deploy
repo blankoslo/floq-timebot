@@ -22,8 +22,4 @@ if ! [ -z "$ENV" ]; then
   gcloud docker -- push "$IMAGE_NAME:$TAG"
   docker tag floq-timebot "$IMAGE_NAME:$ENV"
   gcloud docker -- push "$IMAGE_NAME:$ENV"
-  "$HOME/google-cloud-sdk/bin/kubectl" \
-    set image deployment/floq-timebot \
-    --namespace=floq-blank-$ENV \
-    "floq-timebot=$IMAGE_NAME:$TAG"
 fi
