@@ -52,6 +52,7 @@ const notifySlakcers = async () => {
 
   const {members: slackUsers} = await slack.users.list();
 
+  console.info('notifiees', notifiees);
   for (const {email, unregistered_days: days} of notifiees) {
     const targetUser = slackUsers.find(u => u.profile.email === email);
 
