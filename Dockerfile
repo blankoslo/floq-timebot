@@ -10,7 +10,4 @@ COPY package.json /timebot/package.json
 RUN npm install
 COPY index.js /timebot/index.js
 
-# CMD [ "node", "--harmony-async-await", "index.js" ]
-
-COPY cronjob /var/spool/cron/crontabs/root
-CMD crond -f -L /var/log/crond.log
+CMD [ "node", "index.js" ]
