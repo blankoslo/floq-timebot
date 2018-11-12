@@ -24,7 +24,7 @@ const nbDays = {
 const greetings = [
   'God dag.',
   'Insjill.',
-  '¡Buenos diaz!',
+  '¡Buenos días!',
   'Buongiorno.',
   '¡Hola!',
   'Hej!',
