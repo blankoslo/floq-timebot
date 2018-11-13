@@ -80,7 +80,7 @@ const notifySlackers = async () => {
 const notifyAdminAboutOvertime = async () => {
   const apiToken = jwt.sign({ role: 'root' }, process.env.API_JWT_SECRET || 'dev-secret-shhh');
 
-  const channel = 'administrasjonen';
+  const channel = 'overtid';
 
   const entries = await request({
     uri: 'http://floq-api/paid_overtime?paid_date=is.null',
