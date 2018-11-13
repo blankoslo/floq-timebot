@@ -5,4 +5,4 @@ are missing.
 
 To run:
 
-    node --harmony-async-await index.js
+    node index.js
