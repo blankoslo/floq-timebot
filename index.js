@@ -33,7 +33,7 @@ const greetings = [
   'Tjena!'
 ];
 
-const notifySlakcers = async () => {
+const notifySlackers = async () => {
   const apiToken = jwt.sign({role: 'root'}, process.env.API_JWT_SECRET || 'dev-secret-shhh');
 
   const notifiees = await request({
@@ -77,4 +77,4 @@ const notifySlakcers = async () => {
   }
 };
 
-notifySlakcers();
+notifySlackers();
