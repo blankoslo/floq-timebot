@@ -90,7 +90,6 @@ const notifyAdminAboutOvertime = async () => {
       authorization: `Bearer ${apiToken}`
     }
   });
-  
   if (entries.length > 0) {
     const greeting = greetings[Math.floor(Math.random() * greetings.length)];
     const message = `${greeting} Det ser ut som noen har ført overtid som ikke er utbetalt💰\n\n`
