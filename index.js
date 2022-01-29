@@ -66,7 +66,7 @@ const notifySlackers = async () => {
       const message = `${greeting} Det ser ut som De har glemt å føre ${nbDays[days]} sist uke`
         + ` (mellom ${firstDate} og ${lastDate}). Hvis du avspaserte: ignorer meg. 😳\n\n`
         + 'Timeføring: https://inni.blank.no/timestamp/\n\n'
-        + 'P.S: Hvis jeg er veldig teit nå, kontakt @eh. 😇';
+        + 'P.S: Hvis jeg er veldig teit nå, kontakt @jahnarne. 😇';
 
       console.log(`Notifying user @${targetUser.name} that s/he is missing ${days} day(s).`);
       console.log(message);
@@ -94,7 +94,7 @@ const notifyAdminAboutOvertime = async () => {
     const greeting = greetings[Math.floor(Math.random() * greetings.length)];
     const message = `${greeting} Det ser ut som noen har ført overtid som ikke er utbetalt💰\n\n`
       + 'Overtid: https://inni.blank.no/overtime\n\n'
-      + 'P.S: Hvis jeg er veldig teit nå, kontakt @kristiane. 😇';
+      + 'P.S: Hvis jeg er veldig teit nå, kontakt @jahnarne. 😇';
 
     console.log(message);
 
