@@ -49,6 +49,10 @@ const notifySlackers = async () => {
       end_date: format(endDate, 'YYYY-MM-DD')
     }
   })
+    .then(employees => {
+      console.info('time_tracking_status response', employees);
+      return employees;
+    })
     .then(employees => employees.filter(({ unregistered_days }) => unregistered_days > 0));
 
   const { members: slackUsers } = await slack.users.list();
