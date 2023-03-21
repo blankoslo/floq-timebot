@@ -8,6 +8,7 @@ const subDays = require('date-fns/sub_days');
 const subWeeks = require('date-fns/sub_weeks');
 const nbLocale = require('date-fns/locale/nb');
 
+const apiUri = process.env.API_URI || 'https://api-test.floq.no';
 const slack = new WebClient(process.env.SLACK_API_TOKEN || '');
 
 const startDate = subWeeks(new Date(), 1);
@@ -37,7 +38,7 @@ const notifySlackers = async () => {
   const apiToken = jwt.sign({role: 'root'}, process.env.API_JWT_SECRET || 'dev-secret-shhh');
 
   const notifiees = await request({
-    uri: 'http://floq-api/rpc/time_tracking_status',
+    uri: `${apiUri}/rpc/time_tracking_status`,
     method: 'POST',
     json: true,
     headers: {
@@ -83,7 +84,7 @@ const notifyAdminAboutOvertime = async () => {
   const channel = 'overtid';
 
   const entries = await request({
-    uri: 'http://floq-api/paid_overtime?paid_date=is.null',
+    uri: `${apiUri}/paid_overtime?paid_date=is.null`,
     method: 'GET',
     json: true,
     headers: {
