@@ -123,7 +123,7 @@ const notifyAdminAboutOvertime = async () => {
 
     console.log(message);
 
-    slack.chat.postMessage({ channel: `#${channel}`, text: message, as_user: true })
+    slack.chat.postMessage({ channel: channel, text: message, as_user: true })
       .then(() => console.log(`Message sent to ${channel}`));
   }
 };
