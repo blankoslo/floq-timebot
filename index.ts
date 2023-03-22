@@ -89,10 +89,10 @@ const notifySlackers = async () => {
         + 'Timeføring: https://inni.blank.no/timestamp/\n\n'
         + 'P.S: Hvis jeg er veldig teit nå, kontakt @jahnarne. 😇';
 
-      console.log(`Notifying user @${targetUser.name} that s/he is missing ${days} day(s).`);
+      console.log(`Notifying user @${targetUser.name} (id ${targetUser.id}) that s/he is missing ${days} day(s).`);
       console.log(message);
 
-      slack.chat.postMessage({ channel: `@${targetUser.name}`, text: message, as_user: true })
+      slack.chat.postMessage({ channel: `@${targetUser.id}`, text: message, as_user: true })
         .then(() => console.log(`Message sent to ${targetUser.name}`));
     }
   }
