@@ -1,4 +1,4 @@
-FROM mhart/alpine-node:8
+FROM node:16-alpine
 
 # Required ENV variables:
 # - API_JWT_SECRET (secret shared with floq-api)
@@ -7,8 +7,17 @@ FROM mhart/alpine-node:8
 
 RUN mkdir -p /timebot
 WORKDIR /timebot
+
+COPY index.ts /timebot/index.ts
 COPY package.json /timebot/package.json
+COPY tsconfig.json /timebot/tsconfig.json
+
 RUN npm install
-COPY index.js /timebot/index.js
+RUN npm run build
+RUN cp dist/index.js /timebot/index.js
+
+RUN rm index.ts
+RUN rm package.json
+RUN rm tsconfig.json
 
 CMD [ "node", "index.js" ]
