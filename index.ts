@@ -89,11 +89,11 @@ const notifySlackers = async () => {
         + 'Timeføring: https://inni.blank.no/timestamp/\n\n'
         + 'P.S: Hvis jeg er veldig teit nå, kontakt @jahnarne. 😇';
 
-      console.log(`Notifying user @${targetUser.name} (id ${targetUser.id}) that s/he is missing ${days} day(s).`);
-      console.log(message);
+      console.info(`Notifying user @${targetUser.name} (id ${targetUser.id}) that s/he is missing ${days} day(s).`);
+      console.info(message);
 
       slack.chat.postMessage({ channel: targetUser.id, text: message, as_user: true })
-        .then(() => console.log(`Message sent to ${targetUser.name}`));
+        .then(() => console.info(`Message sent to ${targetUser.name}`));
     }
   }
 };
@@ -117,17 +117,25 @@ const notifyAdminAboutOvertime = async () => {
 
   if (entries.length > 0) {
     const channels = await slack.conversations.list();
+    console.info('all channels', channels);
+
     const channel = channels.channels!.find((c) => c.name === channelName);
+    console.info('matching channel', channel);
+
+    if (!channel) {
+      console.error(`Could not find any channel with a name matching ${channelName}`);
+      return;
+    }
 
     const greeting = greetings[Math.floor(Math.random() * greetings.length)];
     const message = `${greeting} Det ser ut som noen har ført overtid som ikke er utbetalt💰\n\n`
       + 'Overtid: https://inni.blank.no/overtime\n\n'
       + 'P.S: Hvis jeg er veldig teit nå, kontakt @jahnarne. 😇';
 
-    console.log(message);
+    console.info(message);
 
     slack.chat.postMessage({ channel: channel.id, text: message, as_user: true })
-      .then(() => console.log(`Message sent to ${channelName}`));
+      .then(() => console.info(`Message sent to ${channelName}`));
   }
 };
 
