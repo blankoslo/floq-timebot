@@ -1,8 +1,8 @@
 import fetch from 'node-fetch';
 import { WebClient } from '@slack/web-api';
 import * as jwt from 'jsonwebtoken';
-import { format, subDays, subWeeks } from 'date-fns';
-import nbLocale from 'date-fns/locale/nb';
+import * as Moment from 'moment';
+const moment = require('moment');
 
 type Employee = {
   email: string;
@@ -11,9 +11,6 @@ type Employee = {
 
 const apiUri = process.env.API_URI || 'https://api-test.floq.no';
 const slack = new WebClient(process.env.SLACK_API_TOKEN || '');
-
-const startDate = subWeeks(new Date(), 1);
-const endDate = subDays(new Date(), 1);
 
 const greetings = [
   'God dag.',
@@ -47,6 +44,9 @@ function toDaysString(days: number) : String {
 const notifySlackers = async () => {
   const apiToken = jwt.sign({role: 'root'}, process.env.API_JWT_SECRET || 'dev-secret-shhh');
 
+  const firstDateOfLastWeek: Moment.Moment = moment().add(-1, 'week').startOf('isoWeek').locale('nb');
+  const lastDateOfLastWeek: Moment.Moment = moment().add(-1, 'week').endOf('isoWeek').locale('nb');
+
   const employeeResponse = await fetch(
     `${apiUri}/rpc/time_tracking_status`, 
     {
@@ -57,8 +57,8 @@ const notifySlackers = async () => {
         'Content-Type': 'application/json'
       },
       body: JSON.stringify({
-        start_date: format(startDate, 'yyyy-MM-dd'),
-        end_date: format(endDate, 'yyyy-MM-dd')
+        start_date: firstDateOfLastWeek.format('YYYY-MM-DD'),
+        end_date: lastDateOfLastWeek.format('YYYY-MM-DD')
       })
     }
   );
@@ -66,6 +66,7 @@ const notifySlackers = async () => {
   console.info('time_tracking_status response', employees);
 
   const notifiees = employees.filter(({ unregistered_days }) => unregistered_days > 0);
+  console.info('notifiees', notifiees);
 
   const { members: slackUsers } = await slack.users.list();
   if (!slackUsers) {
@@ -73,15 +74,14 @@ const notifySlackers = async () => {
     return;
   }
 
-  console.info('notifiees', notifiees);
   for (const { email, unregistered_days: days } of notifiees) {
     const targetUser = slackUsers.find(u => u.profile!.email === email);
 
     if (targetUser === undefined) {
       console.error(`Slack user for email ${email} not found.`);
     } else {
-      const firstDate = format(startDate, 'Do MMMM', { locale: nbLocale });
-      const lastDate = format(endDate, 'Do MMMM', { locale: nbLocale });
+      const firstDate = firstDateOfLastWeek.format('Do MMMM');
+      const lastDate = lastDateOfLastWeek.format('Do MMMM');
       const greeting = greetings[Math.floor(Math.random() * greetings.length)];
 
       const message = `${greeting} Det ser ut som De har glemt å føre ${toDaysString(days)} sist uke`
@@ -117,7 +117,7 @@ const notifyAdminAboutOvertime = async () => {
 
   if (entries.length > 0) {
     const channels = await slack.conversations.list();
-    console.info('all channels', channels);
+    console.info('all channels', channels.channels.map((c) => c.name));
 
     const channel = channels.channels!.find((c) => c.name === channelName);
     console.info('matching channel', channel);

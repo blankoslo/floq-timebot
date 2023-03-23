@@ -14,8 +14,8 @@
   "dependencies": {
     "@slack/web-api": "^6.8.1",
     "@types/jsonwebtoken": "^9.0.1",
-    "date-fns": "^2.29.3",
     "jsonwebtoken": "^9.0.0",
+    "moment": "^2.29.4",
     "node-fetch": "2"
   },
   "devDependencies": {
