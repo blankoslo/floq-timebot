@@ -101,7 +101,7 @@ const notifySlackers = async () => {
 const notifyAdminAboutOvertime = async () => {
   const apiToken = jwt.sign({ role: 'root' }, process.env.API_JWT_SECRET || 'dev-secret-shhh');
 
-  const channel = 'overtid';
+  const channelName = 'overtid';
 
   const overtimeResponse = await fetch(
     `${apiUri}/paid_overtime?paid_date=is.null`, 
@@ -116,6 +116,9 @@ const notifyAdminAboutOvertime = async () => {
   const entries = await overtimeResponse.json() as any[];
 
   if (entries.length > 0) {
+    const channels = await slack.conversations.list();
+    const channel = channels.channels!.find((c) => c.name === channelName);
+
     const greeting = greetings[Math.floor(Math.random() * greetings.length)];
     const message = `${greeting} Det ser ut som noen har ført overtid som ikke er utbetalt💰\n\n`
       + 'Overtid: https://inni.blank.no/overtime\n\n'
@@ -123,8 +126,8 @@ const notifyAdminAboutOvertime = async () => {
 
     console.log(message);
 
-    slack.chat.postMessage({ channel: channel, text: message, as_user: true })
-      .then(() => console.log(`Message sent to ${channel}`));
+    slack.chat.postMessage({ channel: channel.id, text: message, as_user: true })
+      .then(() => console.log(`Message sent to ${channelName}`));
   }
 };
 
