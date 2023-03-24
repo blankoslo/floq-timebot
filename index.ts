@@ -92,8 +92,8 @@ const notifySlackers = async () => {
       console.info(`Notifying user @${targetUser.name} (id ${targetUser.id}) that s/he is missing ${days} day(s).`);
       console.info(message);
 
-      slack.chat.postMessage({ channel: targetUser.id, text: message, as_user: true })
-        .then(() => console.info(`Message sent to ${targetUser.name}`));
+      // slack.chat.postMessage({ channel: targetUser.id, text: message, as_user: true })
+      //   .then(() => console.info(`Message sent to ${targetUser.name}`));
     }
   }
 };
