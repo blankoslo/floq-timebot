@@ -47,6 +47,13 @@ const notifySlackers = async () => {
   const firstDateOfLastWeek: Moment.Moment = moment().add(-1, 'week').startOf('isoWeek').locale('nb');
   const lastDateOfLastWeek: Moment.Moment = moment().add(-1, 'week').endOf('isoWeek').locale('nb');
 
+  const body = JSON.stringify({
+    start_date: firstDateOfLastWeek.format('YYYY-MM-DD'),
+    end_date: lastDateOfLastWeek.format('YYYY-MM-DD')
+  });
+  console.info(`${apiUri}/rpc/time_tracking_status body`, body);
+
+
   const employeeResponse = await fetch(
     `${apiUri}/rpc/time_tracking_status`, 
     {
@@ -56,10 +63,7 @@ const notifySlackers = async () => {
         'Accept': 'application/json',
         'Content-Type': 'application/json'
       },
-      body: JSON.stringify({
-        start_date: firstDateOfLastWeek.format('YYYY-MM-DD'),
-        end_date: lastDateOfLastWeek.format('YYYY-MM-DD')
-      })
+      body: body,
     }
   );
   const employees = await employeeResponse.json() as Employee[];
@@ -74,14 +78,15 @@ const notifySlackers = async () => {
     return;
   }
 
+  const firstDate = firstDateOfLastWeek.format('Do MMMM');
+  const lastDate = lastDateOfLastWeek.format('Do MMMM');
+
   for (const { email, unregistered_days: days } of notifiees) {
     const targetUser = slackUsers.find(u => u.profile!.email === email);
 
     if (targetUser === undefined) {
       console.error(`Slack user for email ${email} not found.`);
     } else {
-      const firstDate = firstDateOfLastWeek.format('Do MMMM');
-      const lastDate = lastDateOfLastWeek.format('Do MMMM');
       const greeting = greetings[Math.floor(Math.random() * greetings.length)];
 
       const message = `${greeting} Det ser ut som De har glemt å føre ${toDaysString(days)} sist uke`
@@ -117,10 +122,7 @@ const notifyAdminAboutOvertime = async () => {
 
   if (entries.length > 0) {
     const channels = await slack.conversations.list();
-    console.info('all channels', channels.channels.map((c) => c.name));
-
     const channel = channels.channels!.find((c) => c.name === channelName);
-    console.info('matching channel', channel);
 
     if (!channel) {
       console.error(`Could not find any channel with a name matching ${channelName}`);
