@@ -24,9 +24,9 @@ const greetings = [
   'Tjena!'
 ];
 
-function toDaysString(days: number) : String {
+function toDaysString(days: number): String {
   switch (days) {
-    case 1: 
+    case 1:
       return 'én dag';
     case 2:
       return 'to dager';
@@ -42,7 +42,7 @@ function toDaysString(days: number) : String {
 }
 
 const notifySlackers = async () => {
-  const apiToken = jwt.sign({role: 'root'}, process.env.API_JWT_SECRET || 'dev-secret-shhh');
+  const apiToken = jwt.sign({ role: 'root' }, process.env.API_JWT_SECRET || 'dev-secret-shhh');
 
   const firstDateOfLastWeek: Moment.Moment = moment().add(-1, 'week').startOf('isoWeek').locale('nb');
   const lastDateOfLastWeek: Moment.Moment = moment().add(-1, 'week').endOf('isoWeek').locale('nb');
@@ -55,7 +55,7 @@ const notifySlackers = async () => {
 
 
   const employeeResponse = await fetch(
-    `${apiUri}/rpc/time_tracking_status`, 
+    `${apiUri}/rpc/time_tracking_status`,
     {
       method: 'POST',
       headers: {
@@ -109,7 +109,7 @@ const notifyAdminAboutOvertime = async () => {
   const channelName = 'overtid';
 
   const overtimeResponse = await fetch(
-    `${apiUri}/paid_overtime?paid_date=is.null`, 
+    `${apiUri}/paid_overtime?paid_date=is.null`,
     {
       method: 'GET',
       headers: {
@@ -125,7 +125,7 @@ const notifyAdminAboutOvertime = async () => {
     const channel = channels.channels!.find((c) => c.name === channelName);
 
     if (!channel) {
-      console.error(`Could not find any channel with a name matching ${channelName}`);
+      console.error(`Could not find any channel with a name matching "${channelName}"`);
       return;
     }
 
