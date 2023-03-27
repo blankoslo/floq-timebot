@@ -132,7 +132,7 @@ const notifyAdminAboutOvertime = async () => {
   const entries = await overtimeResponse.json() as any[];
 
   if (entries.length > 0) {
-    const { channels, error: getChannelsError } = await slack.conversations.list();
+    const { channels, error: getChannelsError } = await slack.conversations.list({types: "public_channel,private_channel"});
     if (getChannelsError) {
       console.error('Got an error response when trying to get slack channels', getChannelsError);
       return;
