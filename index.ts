@@ -1,8 +1,7 @@
 import fetch from 'node-fetch';
 import { WebClient } from '@slack/web-api';
 import * as jwt from 'jsonwebtoken';
-import * as Moment from 'moment';
-const moment = require('moment');
+import moment from 'moment';
 
 type Employee = {
   email: string;
@@ -44,8 +43,8 @@ function toDaysString(days: number): String {
 const notifySlackers = async () => {
   const apiToken = jwt.sign({ role: 'root' }, process.env.API_JWT_SECRET || 'dev-secret-shhh');
 
-  const firstDateOfLastWeek: Moment.Moment = moment().add(-1, 'week').startOf('isoWeek').locale('nb');
-  const lastDateOfLastWeek: Moment.Moment = moment().add(-1, 'week').endOf('isoWeek').locale('nb');
+  const firstDateOfLastWeek = moment().add(-1, 'week').startOf('isoWeek').locale('nb');
+  const lastDateOfLastWeek = moment().add(-1, 'week').endOf('isoWeek').locale('nb');
 
   const body = JSON.stringify({
     start_date: firstDateOfLastWeek.format('YYYY-MM-DD'),
@@ -72,7 +71,11 @@ const notifySlackers = async () => {
   const notifiees = employees.filter(({ unregistered_days }) => unregistered_days > 0);
   console.info('notifiees', notifiees);
 
-  const { members: slackUsers } = await slack.users.list();
+  const { members: slackUsers, error: getUsersError } = await slack.users.list();
+  if (getUsersError) {
+    console.error("Got an error response when trying to get slack users ", getUsersError);
+    return;
+  }
   if (!slackUsers) {
     console.error("Found no slack users");
     return;
@@ -97,8 +100,16 @@ const notifySlackers = async () => {
       console.info(`Notifying user @${targetUser.name} (id ${targetUser.id}) that s/he is missing ${days} day(s).`);
       console.info(message);
 
-      slack.chat.postMessage({ channel: targetUser.id, text: message, as_user: true })
-        .then(() => console.info(`Message sent to ${targetUser.name}`));
+      const { ok, postMessageError } = await slack.chat.postMessage({ channel: targetUser.id, text: message, as_user: true });
+      if (postMessageError) {
+        console.error(`Got an error response when trying to post message to ${targetUser.name}`, postMessageError);
+        return;
+      }
+      if (!ok) {
+        console.error(`Message was not sent to ${targetUser.name} and response contained no error`);
+        return;
+      }
+      console.info('Message sent to', targetUser.name);
     }
   }
 };
@@ -121,9 +132,17 @@ const notifyAdminAboutOvertime = async () => {
   const entries = await overtimeResponse.json() as any[];
 
   if (entries.length > 0) {
-    const channels = await slack.conversations.list();
-    const channel = channels.channels!.find((c) => c.name === channelName);
+    const { channels, error: getChannelsError } = await slack.conversations.list();
+    if (getChannelsError) {
+      console.error('Got an error response when trying to get slack channels', getChannelsError);
+      return;
+    }
+    if (!channels) {
+      console.error('Found no slack channels');
+      return;
+    }
 
+    const channel = channels.find((c) => c.name === channelName);
     if (!channel) {
       console.error(`Could not find any channel with a name matching "${channelName}"`);
       return;
@@ -136,8 +155,16 @@ const notifyAdminAboutOvertime = async () => {
 
     console.info(message);
 
-    slack.chat.postMessage({ channel: channel.id, text: message, as_user: true })
-      .then(() => console.info(`Message sent to ${channelName}`));
+    const { ok, postMessageError } = await slack.chat.postMessage({ channel: channel.id, text: message, as_user: true });
+    if (postMessageError) {
+      console.error('Got an error response when trying to post message about overtime', postMessageError);
+      return;
+    }
+    if (!ok) {
+      console.error(`Message was not sent to ${channelName} and response contained no error`);
+      return;
+    }
+    console.info('Message sent to', channelName);
   }
 };
 
