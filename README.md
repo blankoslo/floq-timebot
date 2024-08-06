@@ -8,6 +8,7 @@ To run:
     node index.js
 
 # Production environment
+
 Push to master is build automatically:
 https://console.cloud.google.com/cloud-build/triggers;region=global/edit/6c94f2be-f12a-4339-904e-fb9d10a88314?project=marine-cycle-97212
 
@@ -16,3 +17,10 @@ https://console.cloud.google.com/gcr/images/marine-cycle-97212/global/github.com
 
 The job is executed every monday at 9 by:
 https://console.cloud.google.com/run/jobs/details/europe-north1/floq-prod-timebot/executions?project=marine-cycle-97212
+
+# Testing
+
+There is no separate testing environment. In order to test:
+
+1. Deploy a new version to production.
+2. Execute the [Cloud Run Job](https://console.cloud.google.com/run/jobs/details/europe-north1/floq-prod-timebot/executions?authuser=1&project=marine-cycle-97212&supportedpurview=project) with overrides and add the env variable `DRY_RUN=true`. Execute with overrides is available through the drop-down next to the execute button.
