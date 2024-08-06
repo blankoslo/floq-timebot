@@ -42,8 +42,8 @@ function toDaysString(days: number): String {
   }
 }
 
-const isFirstOfMonth = moment().date() === 1;
-const isMonday = moment().day() === 1;
+const isFirstOfMonth = process.env.IS_FIRST_OF_MONTH || moment().date() === 1;
+const isMonday = process.env.IS_MONDAY || moment().day() === 1;
 
 const getStartAndEndDate = () => {
   moment.locale("nb");
