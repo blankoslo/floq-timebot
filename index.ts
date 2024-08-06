@@ -22,7 +22,7 @@ const greetings = [
   "Selamat pagi!",
   "Guten tag.",
   "Tjena!",
-  "Xin chào",
+  "Xin chào.",
 ];
 
 function toDaysString(days: number): String {
@@ -42,11 +42,11 @@ function toDaysString(days: number): String {
   }
 }
 
+moment.locale("nb");
 const isFirstOfMonth = process.env.IS_FIRST_OF_MONTH || moment().date() === 1;
 const isMonday = process.env.IS_MONDAY || moment().day() === 1;
 
 const getStartAndEndDate = () => {
-  moment.locale("nb");
   let startDate, endDate;
 
   if (isFirstOfMonth && !isMonday) {
@@ -127,7 +127,11 @@ const notifySlackers = async () => {
         `${greeting} Det ser ut som De har glemt å føre ${toDaysString(
           days
         )} ${getWeekString()}` +
-        ` (mellom ${firstDate} og ${lastDate}). Hvis du avspaserte: ignorer meg. 😳\n\n` +
+        ` ${
+          firstDate === lastDate
+            ? `(${firstDate})`
+            : `(mellom ${firstDate} og ${lastDate})`
+        }. Hvis du avspaserte: ignorer meg. 😳\n\n` +
         "Timeføring: https://inni.blank.no/timestamp/\n\n" +
         "P.S: Hvis jeg er veldig teit nå, kontakt @jahnarne. 😇";
 
