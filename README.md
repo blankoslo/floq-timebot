@@ -24,3 +24,13 @@ There is no separate testing environment. In order to test:
 
 1. Deploy a new version to production.
 2. Execute the [Cloud Run Job](https://console.cloud.google.com/run/jobs/details/europe-north1/floq-prod-timebot/executions?authuser=1&project=marine-cycle-97212&supportedpurview=project) with overrides and add the env variable `DRY_RUN=true`. Execute with overrides is available through the drop-down next to the execute button.
+
+When testing there are some environment variables available for easier testing:
+
+| Environment Variable | Description                               | Default Value |
+| -------------------- | ----------------------------------------- | ------------- |
+| `DRY_RUN`            | If set to true, no notifications are sent | `false`       |
+| `IS_FIRST_OF_MONTH`  | Simulate running on the 1st of the month  | `false`       |
+| `IS_MONDAY`          | Simulate running on a Monday              | `false`       |
+
+For reverting back to previous versions after testing, delete the latest image from the [Container Registry](https://console.cloud.google.com/gcr/images/marine-cycle-97212/global/github.com/blankoslo/floq-timebot?authuser=1&tab=info) or change the latest tag.
