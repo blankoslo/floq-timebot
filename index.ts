@@ -21,16 +21,26 @@ const slack = new WebClient(process.env.SLACK_API_TOKEN || "");
 const DRY_RUN = process.env.DRY_RUN === "true";
 
 const greetings = [
-  "God dag.",
-  "Insjill.",
-  "¡Buenos días!",
-  "Buongiorno.",
-  "¡Hola!",
-  "Hej!",
-  "Selamat pagi!",
-  "Guten tag.",
-  "Tjena!",
-  "Xin chào.",
+  "God morgen! 🌞",
+  "Hei på deg 😎",
+  "Morn morn ☕",
+  "Bonjour! 👨🏼‍🎨",
+  "Buenos días! 🌵",
+  "Buongiorno! 🍕",
+  "Guten Morgen! 🍺",
+  "Good morning! 🕶️",
+  "Selamat pagi! 🏝️",
+  "おはようございます! 🍣",
+  "Tjena! 🐟",
+  "Hei hei 😄",
+  "Xin chào! 🐲",
+  "Dobré ráno! 🍺",
+  "Sveiki! 🎻",
+  "Καλημέρα! 🏛️",
+  "Shubh prabhat! 🕌",
+  "Habari za asubuhi! 🦁",
+  "Cześć! 🥟",
+  "Salam! 🌺"
 ];
 
 function toDaysString(days: number): String {
@@ -380,17 +390,8 @@ const notifySlackers = async () => {
       
       // Add specific missing days if we found them
       if (missing_days.length > 0) {
-        message += `📅 *Manglende dager:* ${missingDaysFormatted}\n\n`;
-        
-        // If the count of missing days from detailed analysis differs from the original count,
-        // it means some days were excluded due to Avspasering
-        if (missing_days.length < days) {
-          const excludedDays = days - missing_days.length;
-          message += `ℹ️ *NB:* ${excludedDays} ${excludedDays === 1 ? 'dag' : 'dager'} med avspasering er ikke inkludert i oversikten over.\n\n`;
-        }
+        message += `📅 *Manglende dager:* ${missingDaysFormatted}\n\n`;        
       }
-      
-      message += "Hvis du avspaserte: ignorer meg. 😳\n\n";
       message += "Timeføring: https://inni.blank.no/timestamp/\n\n";
       message += "P.S: Hvis jeg er veldig teit nå, kontakt @jahnarne. 😇";
 
