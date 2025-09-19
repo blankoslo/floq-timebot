@@ -91,6 +91,55 @@ const getEmployeeIdFromEmail = async (email: string): Promise<number | null> => 
   }
 };
 
+// Helper function to check if an employee has "Avspasering" (time off in lieu) on a specific day
+const hasAvspaseringOnDate = async (
+  employeeId: number,
+  date: moment.Moment
+): Promise<boolean> => {
+  const apiToken = jwt.sign(
+    { role: "root" },
+    process.env.API_JWT_SECRET || "dev-secret-shhh"
+  );
+
+  const dateStr = date.format("YYYY-MM-DD");
+  const body = JSON.stringify({
+    employee_id: employeeId,
+    date: dateStr,
+  });
+
+  try {
+    const response = await fetch(`${apiUri}/rpc/projects_for_employee_for_date`, {
+      method: "POST",
+      headers: {
+        Authorization: `Bearer ${apiToken}`,
+        Accept: "application/json",
+        "Content-Type": "application/json",
+      },
+      body: body,
+    });
+
+    const result = await response.json();
+    
+    // Check if any project has the name "Avspasering"
+    if (Array.isArray(result)) {
+      const hasAvspasering = result.some(project => 
+        project.project && project.project.toLowerCase().includes('avspasering')
+      );
+      
+      if (hasAvspasering) {
+        console.info(`Employee ${employeeId} has Avspasering on ${dateStr}`);
+      }
+      
+      return hasAvspasering;
+    }
+    
+    return false;
+  } catch (error) {
+    console.error(`Error checking Avspasering for employee ${employeeId} on ${dateStr}:`, error);
+    return false; // Assume no Avspasering on error to avoid false negatives
+  }
+};
+
 // Helper function to get accumulated hours for an employee for a specific day
 const getAccumulatedHoursForDay = async (
   employeeId: number,
@@ -127,7 +176,7 @@ const getAccumulatedHoursForDay = async (
   }
 };
 
-// Helper function to get all weekdays with 0 hours for an employee
+// Helper function to get all weekdays with 0 hours for an employee (excluding days with Avspasering)
 const getMissingDaysForEmployee = async (
   employeeId: number,
   startDate: moment.Moment,
@@ -141,7 +190,13 @@ const getMissingDaysForEmployee = async (
     if (current.day() >= 1 && current.day() <= 5) {
       const hours = await getAccumulatedHoursForDay(employeeId, current);
       if (hours === 0) {
-        missingDays.push(current.format("YYYY-MM-DD"));
+        // Check if the employee has "Avspasering" on this day
+        const hasAvspasering = await hasAvspaseringOnDate(employeeId, current);
+        if (!hasAvspasering) {
+          missingDays.push(current.format("YYYY-MM-DD"));
+        } else {
+          console.info(`Skipping ${current.format("YYYY-MM-DD")} for employee ${employeeId} - has Avspasering`);
+        }
       }
     }
     current.add(1, 'day');
@@ -254,12 +309,24 @@ const notifySlackers = async () => {
     });
   }
 
-  console.info("employees with missing days", employeesWithMissingDays);
+  console.info("employees with missing days (before Avspasering filtering)", employeesWithMissingDays);
+  
+  // Filter out employees who have no actual missing days (all were Avspasering)
+  const employeesWithActualMissingDays = employeesWithMissingDays.filter(employee => 
+    employee.missing_days.length > 0
+  );
+  
+  console.info("employees with actual missing days (after Avspasering filtering)", employeesWithActualMissingDays);
+  
+  if (employeesWithActualMissingDays.length < employeesWithMissingDays.length) {
+    const filteredOut = employeesWithMissingDays.length - employeesWithActualMissingDays.length;
+    console.info(`${filteredOut} employee(s) filtered out - all their missing days were Avspasering days`);
+  }
 
   // If no employees have detailed missing days info (due to missing employee_id),
   // fall back to sending basic notifications
-  let employeesToNotify = employeesWithMissingDays;
-  if (employeesWithMissingDays.length === 0 && notifiees.length > 0) {
+  let employeesToNotify = employeesWithActualMissingDays;
+  if (employeesWithActualMissingDays.length === 0 && notifiees.length > 0) {
     console.info("\nFalling back to basic notifications without detailed day analysis");
     console.info("Reason: employee_id not available in time_tracking_status response\n");
     
@@ -314,6 +381,13 @@ const notifySlackers = async () => {
       // Add specific missing days if we found them
       if (missing_days.length > 0) {
         message += `📅 *Manglende dager:* ${missingDaysFormatted}\n\n`;
+        
+        // If the count of missing days from detailed analysis differs from the original count,
+        // it means some days were excluded due to Avspasering
+        if (missing_days.length < days) {
+          const excludedDays = days - missing_days.length;
+          message += `ℹ️ *NB:* ${excludedDays} ${excludedDays === 1 ? 'dag' : 'dager'} med avspasering er ikke inkludert i oversikten over.\n\n`;
+        }
       }
       
       message += "Hvis du avspaserte: ignorer meg. 😳\n\n";
