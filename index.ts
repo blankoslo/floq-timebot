@@ -6,6 +6,14 @@ import moment from "moment";
 type Employee = {
   email: string;
   unregistered_days: number;
+  employee_id?: number;
+};
+
+type EmployeeWithMissingDays = {
+  email: string;
+  unregistered_days: number;
+  employee_id: number;
+  missing_days: string[];
 };
 
 const apiUri = process.env.API_URI || "https://api-test.floq.no";
@@ -13,16 +21,26 @@ const slack = new WebClient(process.env.SLACK_API_TOKEN || "");
 const DRY_RUN = process.env.DRY_RUN === "true";
 
 const greetings = [
-  "God dag.",
-  "Insjill.",
-  "¡Buenos días!",
-  "Buongiorno.",
-  "¡Hola!",
-  "Hej!",
-  "Selamat pagi!",
-  "Guten tag.",
-  "Tjena!",
-  "Xin chào.",
+  "God morgen! 🌞",
+  "Hei på deg 😎",
+  "Morn morn ☕",
+  "Bonjour! 👨🏼‍🎨",
+  "Buenos días! 🌵",
+  "Buongiorno! 🍕",
+  "Guten Morgen! 🍺",
+  "Good morning! 🕶️",
+  "Selamat pagi! 🏝️",
+  "おはようございます! 🍣",
+  "Tjena! 🐟",
+  "Hei hei 😄",
+  "Xin chào! 🐲",
+  "Dobré ráno! 🍺",
+  "Sveiki! 🎻",
+  "Καλημέρα! 🏛️",
+  "Shubh prabhat! 🕌",
+  "Habari za asubuhi! 🦁",
+  "Cześć! 🥟",
+  "Salam! 🌺"
 ];
 
 function toDaysString(days: number): String {
@@ -46,6 +64,157 @@ moment.locale("nb");
 const isFirstOfMonth = process.env.IS_FIRST_OF_MONTH || moment().date() === 1;
 const isMonday = process.env.IS_MONDAY || moment().day() === 1;
 
+// Helper function to get employee ID from email using employees_roles function
+const getEmployeeIdFromEmail = async (email: string): Promise<number | null> => {
+  const apiToken = jwt.sign(
+    { role: "root" },
+    process.env.API_JWT_SECRET || "dev-secret-shhh"
+  );
+
+  const body = JSON.stringify({
+    email_param: email
+  });
+
+  try {
+    const response = await fetch(`${apiUri}/rpc/employees_roles`, {
+      method: "POST",
+      headers: {
+        Authorization: `Bearer ${apiToken}`,
+        Accept: "application/json",
+        "Content-Type": "application/json",
+      },
+      body: body,
+    });
+
+    const result = await response.json();
+    
+    // The function returns an array, and we want the first result's employee.id
+    if (Array.isArray(result) && result.length > 0 && result[0].employee) {
+      return result[0].employee.id;
+    }
+    
+    console.warn(`No employee found for email: ${email}`);
+    return null;
+  } catch (error) {
+    console.error(`Error getting employee ID for ${email}:`, error);
+    return null;
+  }
+};
+
+// Helper function to check if an employee has "Avspasering" (time off in lieu) on a specific day
+const hasAvspaseringOnDate = async (
+  employeeId: number,
+  date: moment.Moment
+): Promise<boolean> => {
+  const apiToken = jwt.sign(
+    { role: "root" },
+    process.env.API_JWT_SECRET || "dev-secret-shhh"
+  );
+
+  const dateStr = date.format("YYYY-MM-DD");
+  const body = JSON.stringify({
+    employee_id: employeeId,
+    date: dateStr,
+  });
+
+  try {
+    const response = await fetch(`${apiUri}/rpc/projects_for_employee_for_date`, {
+      method: "POST",
+      headers: {
+        Authorization: `Bearer ${apiToken}`,
+        Accept: "application/json",
+        "Content-Type": "application/json",
+      },
+      body: body,
+    });
+
+    const result = await response.json();
+    
+    // Check if any project has the name "Avspasering"
+    if (Array.isArray(result)) {
+      const hasAvspasering = result.some(project => 
+        project.project && project.project.toLowerCase().includes('avspasering')
+      );
+      
+      if (hasAvspasering) {
+        console.info(`Employee ${employeeId} has Avspasering on ${dateStr}`);
+      }
+      
+      return hasAvspasering;
+    }
+    
+    return false;
+  } catch (error) {
+    console.error(`Error checking Avspasering for employee ${employeeId} on ${dateStr}:`, error);
+    return false; // Assume no Avspasering on error to avoid false negatives
+  }
+};
+
+// Helper function to get accumulated hours for an employee for a specific day
+const getAccumulatedHoursForDay = async (
+  employeeId: number,
+  date: moment.Moment
+): Promise<number> => {
+  const apiToken = jwt.sign(
+    { role: "root" },
+    process.env.API_JWT_SECRET || "dev-secret-shhh"
+  );
+
+  const dateStr = date.format("YYYY-MM-DD");
+  const body = JSON.stringify({
+    employee_id: employeeId,
+    start_date: dateStr,
+    end_date: dateStr, // Same date for both start and end to get just that day
+  });
+
+  try {
+    const response = await fetch(`${apiUri}/rpc/accumulated_hours_for_employee`, {
+      method: "POST",
+      headers: {
+        Authorization: `Bearer ${apiToken}`,
+        Accept: "application/json",
+        "Content-Type": "application/json",
+      },
+      body: body,
+    });
+
+    const result = await response.json();
+    return typeof result === 'number' ? result : 0;
+  } catch (error) {
+    console.error(`Error getting accumulated hours for employee ${employeeId} on ${dateStr}:`, error);
+    return 0;
+  }
+};
+
+// Helper function to get all weekdays with 0 hours for an employee (excluding days with Avspasering)
+const getMissingDaysForEmployee = async (
+  employeeId: number,
+  startDate: moment.Moment,
+  endDate: moment.Moment
+): Promise<string[]> => {
+  const missingDays: string[] = [];
+  const current = startDate.clone();
+  
+  while (current.isSameOrBefore(endDate)) {
+    // Only check weekdays (Monday = 1, Friday = 5)
+    if (current.day() >= 1 && current.day() <= 5) {
+      const hours = await getAccumulatedHoursForDay(employeeId, current);
+      if (hours === 0) {
+        // Check if the employee has "Avspasering" on this day
+        const hasAvspasering = await hasAvspaseringOnDate(employeeId, current);
+        if (!hasAvspasering) {
+          missingDays.push(current.format("YYYY-MM-DD"));
+        } else {
+          console.info(`Skipping ${current.format("YYYY-MM-DD")} for employee ${employeeId} - has Avspasering`);
+        }
+      }
+    }
+    current.add(1, 'day');
+  }
+  
+  return missingDays;
+};
+
 const getStartAndEndDate = () => {
   let startDate, endDate;
 
@@ -68,10 +237,14 @@ const getWeekString = () => {
 };
 
 const notifySlackers = async () => {
+  const jwtPayload = { role: "root" };
   const apiToken = jwt.sign(
-    { role: "root" },
+    jwtPayload,
     process.env.API_JWT_SECRET || "dev-secret-shhh"
   );
+  
+  console.info("JWT Payload:", jwtPayload);
+  console.info("JWT Secret (first 10 chars):", (process.env.API_JWT_SECRET || "dev-secret-shhh").substring(0, 10) + "...");
 
   const { startDate, endDate } = getStartAndEndDate();
 
@@ -90,13 +263,90 @@ const notifySlackers = async () => {
     },
     body: body,
   });
-  const employees = (await employeeResponse.json()) as Employee[];
-  console.info("time_tracking_status response", employees);
+  const employeesData = await employeeResponse.json();
+  console.info("time_tracking_status response", employeesData);
 
+  // Check if the response is an error
+  if (!Array.isArray(employeesData)) {
+    console.error("\n=== API ERROR ===");
+    console.error("Error from time_tracking_status API:", JSON.stringify(employeesData, null, 2));
+    console.error("HTTP Status:", employeeResponse.status);
+    console.error("Request URL:", `${apiUri}/rpc/time_tracking_status`);
+    console.error("Request body:", body);
+    console.error("\nThis might indicate:");
+    console.error("- The time_tracking_status function doesn't exist");
+    console.error("- Wrong parameter names or types");
+    console.error("- Authorization issues");
+    console.error("- Function exists but has different signature");
+    console.error("================\n");
+    return;
+  }
+
+  const employees = employeesData as Employee[];
   const notifiees = employees.filter(
     ({ unregistered_days }) => unregistered_days > 0
   );
   console.info("notifiees", notifiees);
+  
+  // Log all available fields for the first employee to see what we have
+  if (employees.length > 0) {
+    console.info("\n=== AVAILABLE FIELDS IN EMPLOYEE DATA ===");
+    console.info("Sample employee object keys:", Object.keys(employees[0]));
+    console.info("Sample employee object:", JSON.stringify(employees[0], null, 2));
+    console.info("=========================================\n");
+  }
+
+  // Get missing days for each employee with unregistered days
+  const employeesWithMissingDays: EmployeeWithMissingDays[] = [];
+  for (const employee of notifiees) {
+    console.info(`Getting employee ID for ${employee.email}...`);
+    const employeeId = await getEmployeeIdFromEmail(employee.email);
+    
+    if (!employeeId) {
+      console.warn(`Could not get employee_id for ${employee.email}, skipping detailed analysis`);
+      continue;
+    }
+
+    console.info(`Getting missing days for ${employee.email} (ID: ${employeeId})`);
+    const missingDays = await getMissingDaysForEmployee(employeeId, startDate, endDate);
+    
+    employeesWithMissingDays.push({
+      email: employee.email,
+      employee_id: employeeId,
+      unregistered_days: employee.unregistered_days,
+      missing_days: missingDays
+    });
+  }
+
+  console.info("employees with missing days (before Avspasering filtering)", employeesWithMissingDays);
+  
+  // Filter out employees who have no actual missing days (all were Avspasering)
+  const employeesWithActualMissingDays = employeesWithMissingDays.filter(employee => 
+    employee.missing_days.length > 0
+  );
+  
+  console.info("employees with actual missing days (after Avspasering filtering)", employeesWithActualMissingDays);
+  
+  if (employeesWithActualMissingDays.length < employeesWithMissingDays.length) {
+    const filteredOut = employeesWithMissingDays.length - employeesWithActualMissingDays.length;
+    console.info(`${filteredOut} employee(s) filtered out - all their missing days were Avspasering days`);
+  }
+
+  // If no employees have detailed missing days info (due to missing employee_id),
+  // fall back to sending basic notifications
+  let employeesToNotify = employeesWithActualMissingDays;
+  if (employeesWithActualMissingDays.length === 0 && notifiees.length > 0) {
+    console.info("\nFalling back to basic notifications without detailed day analysis");
+    console.info("Reason: employee_id not available in time_tracking_status response\n");
+    
+    // Convert notifiees to basic notification format
+    employeesToNotify = notifiees.map(employee => ({
+      email: employee.email,
+      employee_id: 0, // placeholder
+      unregistered_days: employee.unregistered_days,
+      missing_days: [] as string[] // will be empty, so we'll show basic message
+    }));
+  }
 
   const { members: slackUsers, error: getUsersError } =
     await slack.users.list();
@@ -115,28 +365,37 @@ const notifySlackers = async () => {
   const firstDate = startDate.format("Do MMMM");
   const lastDate = endDate.format("Do MMMM");
 
-  for (const { email, unregistered_days: days } of notifiees) {
+  for (const employeeWithMissingDays of employeesToNotify) {
+    const { email, unregistered_days: days, missing_days } = employeeWithMissingDays;
     const targetUser = slackUsers.find((u) => u.profile!.email === email);
 
     if (targetUser === undefined) {
       console.error(`Slack user for email ${email} not found.`);
     } else {
       const greeting = greetings[Math.floor(Math.random() * greetings.length)];
+      
+      // Format missing days for display
+      const missingDaysFormatted = missing_days.map(day => 
+        moment(day).format("dddd Do MMMM")
+      ).join(", ");
 
-      const message =
-        `${greeting} Det ser ut som De har glemt å føre ${toDaysString(
-          days
-        )} ${getWeekString()}` +
-        ` ${
-          firstDate === lastDate
-            ? `(${firstDate})`
-            : `(mellom ${firstDate} og ${lastDate})`
-        }. Hvis du avspaserte: ignorer meg. 😳\n\n` +
-        "Timeføring: https://inni.blank.no/timestamp/\n\n" +
-        "P.S: Hvis jeg er veldig teit nå, kontakt @jahnarne. 😇";
+      let message = `${greeting} Det ser ut som De har glemt å føre ${toDaysString(days)} ${getWeekString()}`;
+      
+      message += ` ${
+        firstDate === lastDate
+          ? `(${firstDate})`
+          : `(mellom ${firstDate} og ${lastDate})`
+      }.\n\n`;
+      
+      // Add specific missing days if we found them
+      if (missing_days.length > 0) {
+        message += `📅 *Manglende dager:* ${missingDaysFormatted}\n\n`;        
+      }
+      message += "Timeføring: https://inni.blank.no/timestamp/\n\n";
+      message += "P.S: Hvis jeg er veldig teit nå, kontakt @jahnarne. 😇";
 
       console.info(
-        `Notifying user @${targetUser.name} (id ${targetUser.id}) that s/he is missing ${days} day(s).`
+        `Notifying user @${targetUser.name} (id ${targetUser.id}) that s/he is missing ${days} day(s). Missing days: ${missing_days.join(', ')}`
       );
       console.info(message);
 
