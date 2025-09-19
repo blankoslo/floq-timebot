@@ -245,7 +245,6 @@ const notifySlackers = async () => {
   
   console.info("JWT Payload:", jwtPayload);
   console.info("JWT Secret (first 10 chars):", (process.env.API_JWT_SECRET || "dev-secret-shhh").substring(0, 10) + "...");
-  console.info("Generated JWT (first 50 chars):", apiToken.substring(0, 50) + "...");
 
   const { startDate, endDate } = getStartAndEndDate();
 
