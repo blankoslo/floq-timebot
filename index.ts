@@ -54,46 +54,21 @@ type HolidayRow = { date: string; name: string };
 type ProjectRow = { id: string; name: string };
 
 type DayStatus =
-  | "complete" // 🟢 ≥ 7,5 t with at least some work time
-  | "absence" //  ⚪ ≥ 7,5 t purely absence
-  | "partial" //  🟡 0 < total < 7,5 t
-  | "empty" //    🔴 0 t
-  | "holiday" //  🎌
+  | "complete" //  ≥ 7,5 t with at least some work time
+  | "absence" //   ≥ 7,5 t purely absence
+  | "partial" //   0 < total < 7,5 t
+  | "empty" //     0 t
+  | "holiday"
   | "weekend"; //  dropped from display unless work was logged
 
 type DayBreakdown = {
   date: string; // YYYY-MM-DD
-  weekdayLabel: string; // "Mandag 4. mai"
   status: DayStatus;
   hoursActual: number; // work + absence total (both count toward "registered")
   hoursExpected: number; // 7,5 for workdays, 0 otherwise
   projects: string[]; // pretty labels — includes absence types like "Ferie"
   holidayName?: string;
 };
-
-// === Greetings (kept from previous version) ===
-const greetings = [
-  "God morgen! 🌞",
-  "Hei på deg 😎",
-  "Morn morn ☕",
-  "Bonjour! 👨🏼‍🎨",
-  "Buenos días! 🌵",
-  "Buongiorno! 🍕",
-  "Guten Morgen! 🍺",
-  "Good morning! 🕶️",
-  "Selamat pagi! 🏝️",
-  "おはようございます! 🍣",
-  "Tjena! 🐟",
-  "Hei hei 😄",
-  "Xin chào! 🐲",
-  "Dobré ráno! 🍺",
-  "Sveiki! 🎻",
-  "Καλημέρα! 🏛️",
-  "Shubh prabhat! 🕌",
-  "Habari za asubuhi! 🦁",
-  "Cześć! 🥟",
-  "Salam! 🌺",
-];
 
 // === API helpers ===
 const apiToken = () =>
@@ -323,7 +298,6 @@ function buildPerDayBreakdown(
 
     result.push({
       date: ds,
-      weekdayLabel: d.format("dddd D. MMMM"),
       status,
       hoursActual: totalHours,
       hoursExpected,
@@ -790,9 +764,8 @@ const notifyAdminAboutOvertime = async () => {
     return;
   }
 
-  const greeting = greetings[Math.floor(Math.random() * greetings.length)];
   const message =
-    `${greeting} Det ser ut som noen har ført overtid som ikke er utbetalt 💰\n\n` +
+    "Det ser ut som noen har ført overtid som ikke er utbetalt 💰\n\n" +
     "Overtid: https://inni.blank.no/overtime";
 
   console.info(`Overtime entries: ${entries.length}`);
