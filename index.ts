@@ -9,6 +9,9 @@ const slack = new WebClient(process.env.SLACK_API_TOKEN || "");
 const DRY_RUN = process.env.DRY_RUN === "true";
 const FLOQ_TIMESTAMP_URL =
   process.env.FLOQ_TIMESTAMP_URL || "https://inni.blank.no/timestamp/";
+// When set, only this employee's email will receive a message — useful for
+// previewing how a real Slack render looks without spamming everyone.
+const TEST_USER_EMAIL = process.env.TEST_USER_EMAIL?.toLowerCase().trim();
 // Ignore tiny deltas so a 7,45h vs 7,5h day doesn't trigger a notification.
 const REPORT_TOLERANCE_HOURS = 0.25;
 
@@ -51,46 +54,21 @@ type HolidayRow = { date: string; name: string };
 type ProjectRow = { id: string; name: string };
 
 type DayStatus =
-  | "complete" // 🟢 ≥ 7,5 t with at least some work time
-  | "absence" //  ⚪ ≥ 7,5 t purely absence
-  | "partial" //  🟡 0 < total < 7,5 t
-  | "empty" //    🔴 0 t
-  | "holiday" //  🎌
+  | "complete" //  ≥ 7,5 t with at least some work time
+  | "absence" //   ≥ 7,5 t purely absence
+  | "partial" //   0 < total < 7,5 t
+  | "empty" //     0 t
+  | "holiday"
   | "weekend"; //  dropped from display unless work was logged
 
 type DayBreakdown = {
   date: string; // YYYY-MM-DD
-  weekdayLabel: string; // "Mandag 4. mai"
   status: DayStatus;
   hoursActual: number; // work + absence total (both count toward "registered")
   hoursExpected: number; // 7,5 for workdays, 0 otherwise
   projects: string[]; // pretty labels — includes absence types like "Ferie"
   holidayName?: string;
 };
-
-// === Greetings (kept from previous version) ===
-const greetings = [
-  "God morgen! 🌞",
-  "Hei på deg 😎",
-  "Morn morn ☕",
-  "Bonjour! 👨🏼‍🎨",
-  "Buenos días! 🌵",
-  "Buongiorno! 🍕",
-  "Guten Morgen! 🍺",
-  "Good morning! 🕶️",
-  "Selamat pagi! 🏝️",
-  "おはようございます! 🍣",
-  "Tjena! 🐟",
-  "Hei hei 😄",
-  "Xin chào! 🐲",
-  "Dobré ráno! 🍺",
-  "Sveiki! 🎻",
-  "Καλημέρα! 🏛️",
-  "Shubh prabhat! 🕌",
-  "Habari za asubuhi! 🦁",
-  "Cześć! 🥟",
-  "Salam! 🌺",
-];
 
 // === API helpers ===
 const apiToken = () =>
@@ -320,7 +298,6 @@ function buildPerDayBreakdown(
 
     result.push({
       date: ds,
-      weekdayLabel: d.format("dddd D. MMMM"),
       status,
       hoursActual: totalHours,
       hoursExpected,
@@ -336,52 +313,167 @@ function buildPerDayBreakdown(
 // === Formatting ===
 
 function formatHours(n: number): string {
-  // Norwegian decimal comma, strip trailing ",0"
-  return n.toFixed(1).replace(/\.0$/, "").replace(".", ",");
+  // One decimal always (Norwegian comma) — keeps "7,0 t" aligned with
+  // "7,5 t" in the day list and makes the table easier to scan.
+  return n.toFixed(1).replace(".", ",");
 }
 
-function capitalize(s: string): string {
-  return s.length ? s[0].toUpperCase() + s.slice(1) : s;
+function formatHoursShort(n: number): string {
+  // Strip trailing ",0" — used in the headline where "30 / 30 t" reads
+  // cleaner than "30,0 / 30,0 t".
+  return formatHours(n).replace(/,0$/, "");
 }
 
-function statusBullet(s: DayStatus): string {
+// Full Norwegian weekday names, used in the table view.
+const DAY_NAMES_NB = [
+  "Søndag",
+  "Mandag",
+  "Tirsdag",
+  "Onsdag",
+  "Torsdag",
+  "Fredag",
+  "Lørdag",
+];
+
+function statusIcon(s: DayStatus): string {
+  // Per design: only flag days that warrant attention. Complete days and
+  // absence days don't need a visual marker — the row already conveys it.
   switch (s) {
-    case "complete":
-      return "✅";
     case "partial":
       return "⚠️";
     case "empty":
       return "⛔️";
-    case "absence":
-      return "☑️";
     case "holiday":
-      return "😶‍🌫️";
-    case "weekend":
-      return "·";
+      return "🗓️";
+    default:
+      return "";
   }
 }
 
-function formatPerDayLine(day: DayBreakdown): string {
-  const label = capitalize(day.weekdayLabel);
-  const bullet = statusBullet(day.status);
+// Header / footer cells get bold text; data cells use plain raw_text.
+function headerCell(text: string): Record<string, unknown> {
+  return {
+    type: "rich_text",
+    elements: [
+      {
+        type: "rich_text_section",
+        elements: [{ type: "text", text, style: { bold: true } }],
+      },
+    ],
+  };
+}
+
+function textCell(text: string): Record<string, unknown> {
+  // Slack rejects raw_text cells with empty text ("must be more than 0
+  // characters"). Use a non-breaking space as a visually-empty placeholder
+  // so the table layout stays intact for holiday/absence/totalt rows.
+  return { type: "raw_text", text: text.length > 0 ? text : " " };
+}
+
+function buildTableRow(day: DayBreakdown): Record<string, unknown>[] {
+  const m = moment(day.date);
+  const dayDateLabel = `${DAY_NAMES_NB[m.day()]} ${m.format("D. MMMM")}`;
+  const icon = statusIcon(day.status);
+  const hoursStr = `${formatHours(day.hoursActual)} t`;
 
   if (day.status === "holiday") {
-    return `${bullet} ${label}: ${day.holidayName ?? "Helligdag"}`;
+    return [
+      textCell(dayDateLabel),
+      textCell(""), // no Timer for holidays
+      textCell(day.holidayName ?? "Helligdag"),
+      textCell(icon),
+    ];
+  }
+  if (day.status === "absence") {
+    const label = day.projects.length > 0 ? day.projects.join(" + ") : "Fravær";
+    return [
+      textCell(dayDateLabel),
+      textCell(hoursStr),
+      textCell(label),
+      textCell(""), // no icon for absence
+    ];
+  }
+  if (day.status === "empty") {
+    return [
+      textCell(dayDateLabel),
+      textCell(hoursStr),
+      textCell(""),
+      textCell(icon),
+    ];
+  }
+  // complete or partial
+  const projectStr =
+    day.projects.length > 0
+      ? day.projects.slice(0, 3).join(" + ") +
+        (day.projects.length > 3 ? " m.fl." : "")
+      : "";
+  return [
+    textCell(dayDateLabel),
+    textCell(hoursStr),
+    textCell(projectStr),
+    textCell(icon),
+  ];
+}
+
+function buildTableBlock(
+  days: DayBreakdown[],
+  totalActual: number,
+  totalExpected: number
+): Record<string, unknown> {
+  const headerRow = [
+    headerCell("Dag"),
+    headerCell("Timer"),
+    headerCell("Prosjekt"),
+    headerCell("Status"),
+  ];
+  const dataRows = days.map(buildTableRow);
+  const totalRow = [
+    headerCell("Totalt"),
+    headerCell(`${formatHours(totalActual)} t`),
+    headerCell(`av ${formatHoursShort(totalExpected)} t`),
+    textCell(""),
+  ];
+
+  return {
+    type: "table",
+    column_settings: [
+      { align: "left" }, // Dag (day + date combined)
+      { align: "right" }, // Timer
+      { align: "left", is_wrapped: true }, // Prosjekt
+      { align: "center" }, // Status
+    ],
+    rows: [headerRow, ...dataRows, totalRow],
+  };
+}
+
+function formatPerDayLine(day: DayBreakdown): string {
+  // The day is implicit from row order (Mon–Fri matches the period in the
+  // headline), so we skip the prefix entirely. This sidesteps the alignment
+  // problem entirely and keeps each row to its essentials.
+
+  if (day.status === "holiday") {
+    return `${day.holidayName ?? "Helligdag"} 🗓️`;
   }
   if (day.status === "absence") {
     // Fully covered by absence — show the absence type without hours, since
     // "7,5 t (Ferie)" reads like work.
-    const absenceLabel =
-      day.projects.length > 0 ? day.projects.join(" + ") : "Fravær";
-    return `${bullet} ${label}: ${absenceLabel}`;
+    return day.projects.length > 0 ? day.projects.join(" + ") : "Fravær";
   }
 
+  const hoursStr = formatHours(day.hoursActual);
+
+  if (day.status === "empty") {
+    return `${hoursStr} t ⛔️`;
+  }
+
+  // complete or partial — show hours and project(s)
   const projectStr =
     day.projects.length > 0
       ? day.projects.slice(0, 3).join(" + ") +
         (day.projects.length > 3 ? " m.fl." : "")
       : "-";
-  return `${bullet} ${label}: ${formatHours(day.hoursActual)} t (${projectStr})`;
+  const base = `${hoursStr} t (${projectStr})`;
+  return day.status === "partial" ? `${base} ⚠️` : base;
 }
 
 const numberWord = (n: number): string => {
@@ -407,7 +499,7 @@ function summarize(
   partialDays: number
 ): string {
   const totalDays = emptyDays + partialDays;
-  const missingLabel = `*${formatHours(missingHours)} time${missingHours === 1 ? "" : "r"}*`;
+  const missingLabel = `*${formatHoursShort(missingHours)} time${missingHours === 1 ? "" : "r"}*`;
   const closing = "Ser du over og evt. fører resten? 🙏";
 
   if (totalDays === 0) {
@@ -435,7 +527,6 @@ function buildSlackMessage(
   totalExpected: number,
   hasIssues: boolean
 ): { text: string; blocks: Array<Record<string, unknown>> } {
-  const greeting = greetings[Math.floor(Math.random() * greetings.length)];
   const weekNumber = startDate.isoWeek();
   // Display the work week (mon–fri) rather than the calendar week (mon–sun).
   // For 1st-of-month partial-week runs, cap at endDate so we don't claim
@@ -451,57 +542,33 @@ function buildSlackMessage(
 
   const perDayLines = days.map(formatPerDayLine).join("\n");
 
-  // Intro and (for issues) summary line differ between the two variants.
-  const introLine = hasIssues
-    ? `Det ser ut som timene dine for *${periodLabel}* ikke helt stemmer. Her er det jeg fant:`
-    : `Her er en oversikt over timene dine for *${periodLabel}*:`;
-
   const emptyDays = days.filter((d) => d.status === "empty").length;
   const partialDays = days.filter((d) => d.status === "partial").length;
   const missingHours = Math.max(0, totalExpected - totalActual);
-  const summaryLine = hasIssues
-    ? summarize(missingHours, emptyDays, partialDays)
-    : null;
+
+  // Intro and summary merge into one paragraph. Brief variant stops after
+  // the intro; issues variant appends "Til sammen mangler ...".
+  const baseIntro = `Her er en oversikt over timene dine for *${periodLabel}*.`;
+  const introLine = hasIssues
+    ? `${baseIntro} ${summarize(missingHours, emptyDays, partialDays)}`
+    : baseIntro;
 
   // Plain-text fallback (no markdown asterisks)
   const textLines = [
-    greeting,
-    "",
     introLine.replace(/\*/g, ""),
     "",
-    `Ført denne uka: ${formatHours(totalActual)} / ${formatHours(totalExpected)} t`,
-    "",
     perDayLines,
+    "",
+    `Åpne timeføring: ${FLOQ_TIMESTAMP_URL}`,
   ];
-  if (summaryLine) {
-    textLines.push("", summaryLine.replace(/\*/g, ""));
-  }
-  textLines.push("", `Åpne timeføring: ${FLOQ_TIMESTAMP_URL}`);
   const text = textLines.join("\n");
 
   const blocks: Array<Record<string, unknown>> = [
     {
       type: "section",
-      text: { type: "mrkdwn", text: `${greeting}\n\n${introLine}` },
-    },
-    {
-      type: "section",
-      text: {
-        type: "mrkdwn",
-        text:
-          `*Ført denne uka:* ${formatHours(totalActual)} / ${formatHours(totalExpected)} t\n` +
-          "```\n" +
-          perDayLines +
-          "\n```",
-      },
+      text: { type: "mrkdwn", text: introLine },
     },
   ];
-  if (summaryLine) {
-    blocks.push({
-      type: "section",
-      text: { type: "mrkdwn", text: summaryLine },
-    });
-  }
   blocks.push({
     type: "actions",
     elements: [
@@ -512,6 +579,10 @@ function buildSlackMessage(
       },
     ],
   });
+  // Slack moves the table to the bottom of the message as an attachment
+  // regardless of where it sits in the blocks array — so order here is
+  // for the API, not for visual flow.
+  blocks.push(buildTableBlock(days, totalActual, totalExpected));
 
   return { text, blocks };
 }
@@ -541,8 +612,24 @@ const notifySlackers = async () => {
   // We notify everyone who is expected to work this week — including those
   // who are fully registered (they get the brief variant). People on full-
   // week vacation/parental leave (available_hours = 0) get nothing.
-  const targets = rows.filter((r) => r.available_hours > 0);
+  let targets = rows.filter((r) => r.available_hours > 0);
   console.info(`${targets.length} employees with available_hours > 0`);
+
+  if (TEST_USER_EMAIL) {
+    const before = targets.length;
+    targets = targets.filter(
+      (r) => r.email.toLowerCase() === TEST_USER_EMAIL
+    );
+    console.info(
+      `TEST_USER_EMAIL=${TEST_USER_EMAIL} — filtered ${before} → ${targets.length} target(s)`
+    );
+    if (targets.length === 0) {
+      console.warn(
+        `No employee matching ${TEST_USER_EMAIL} in time_tracking_status — nothing to send`
+      );
+      return;
+    }
+  }
 
   if (targets.length === 0) {
     console.info("Nothing to notify, exiting notifySlackers.");
@@ -677,9 +764,8 @@ const notifyAdminAboutOvertime = async () => {
     return;
   }
 
-  const greeting = greetings[Math.floor(Math.random() * greetings.length)];
   const message =
-    `${greeting} Det ser ut som noen har ført overtid som ikke er utbetalt 💰\n\n` +
+    "Det ser ut som noen har ført overtid som ikke er utbetalt 💰\n\n" +
     "Overtid: https://inni.blank.no/overtime";
 
   console.info(`Overtime entries: ${entries.length}`);
