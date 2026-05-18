@@ -377,9 +377,26 @@ function buildTableRow(day: DayBreakdown): Record<string, unknown>[] {
   const hoursStr = `${formatHours(day.hoursActual)} t`;
 
   if (day.status === "holiday") {
+    // Holidays with registered work: surface both the project and that it
+    // happened on a holiday — and crucially, show the hours so they're
+    // visible (and counted in the total below).
+    if (day.hoursActual > 0) {
+      const projectStr =
+        day.projects.length > 0 ? day.projects.join(" + ") : "";
+      const holidayName = day.holidayName ?? "Helligdag";
+      const combined = projectStr
+        ? `${projectStr} (${holidayName})`
+        : holidayName;
+      return [
+        textCell(dayDateLabel),
+        textCell(hoursStr),
+        textCell(combined),
+        textCell(icon),
+      ];
+    }
     return [
       textCell(dayDateLabel),
-      textCell(""), // no Timer for holidays
+      textCell(""), // no Timer for holidays without work
       textCell(day.holidayName ?? "Helligdag"),
       textCell(icon),
     ];
@@ -452,7 +469,13 @@ function formatPerDayLine(day: DayBreakdown): string {
   // problem entirely and keeps each row to its essentials.
 
   if (day.status === "holiday") {
-    return `${day.holidayName ?? "Helligdag"} 🗓️`;
+    const holidayName = day.holidayName ?? "Helligdag";
+    if (day.hoursActual > 0) {
+      const projectStr =
+        day.projects.length > 0 ? day.projects.join(" + ") : holidayName;
+      return `${formatHours(day.hoursActual)} t (${projectStr}, ${holidayName}) 🗓️`;
+    }
+    return `${holidayName} 🗓️`;
   }
   if (day.status === "absence") {
     // Fully covered by absence — show the absence type without hours, since
@@ -664,22 +687,12 @@ const notifySlackers = async () => {
       projectNames
     );
 
-    // Headline totals are computed from the per-day breakdown so the number
-    // and the table are internally consistent. Absence days are included in
-    // "actual" since e.g. a fully-registered Sykmelding day shouldn't make
-    // the user look short.
-    const shownWorkdays = days.filter(
-      (d) =>
-        d.status === "complete" ||
-        d.status === "partial" ||
-        d.status === "empty" ||
-        d.status === "absence"
-    );
-    const totalActual = shownWorkdays.reduce((s, d) => s + d.hoursActual, 0);
-    const totalExpected = shownWorkdays.reduce(
-      (s, d) => s + d.hoursExpected,
-      0
-    );
+    // Headline totals sum across all surviving days. The filter inside
+    // buildPerDayBreakdown already dropped weekends-without-work and other
+    // noise — anything still here counts. Absence and holiday days have
+    // hoursExpected = 0 so they only contribute to the "actual" side.
+    const totalActual = days.reduce((s, d) => s + d.hoursActual, 0);
+    const totalExpected = days.reduce((s, d) => s + d.hoursExpected, 0);
 
     // Issues-variant only when there's an actual shortfall worth flagging.
     // A 🟡 partial day on its own doesn't qualify if the week's total is
