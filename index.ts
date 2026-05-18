@@ -745,25 +745,6 @@ const notifyAdminAboutOvertime = async () => {
 
   if (entries.length === 0) return;
 
-  let channels;
-  try {
-    const resp = await slack.conversations.list({ types: "public_channel" });
-    channels = resp.channels;
-  } catch (err) {
-    console.error("conversations.list failed:", err);
-    return;
-  }
-  if (!channels) {
-    console.error("No channels in response");
-    return;
-  }
-
-  const channel = channels.find((c) => c.name === channelName);
-  if (!channel) {
-    console.error(`No channel named #${channelName}`);
-    return;
-  }
-
   const message =
     "Det ser ut som noen har ført overtid som ikke er utbetalt 💰\n\n" +
     "Overtid: https://inni.blank.no/overtime";
@@ -776,9 +757,12 @@ const notifyAdminAboutOvertime = async () => {
     return;
   }
 
+  // Post directly by channel name — chat.postMessage accepts "#name" and
+  // doesn't require enumerating channels first, which would have needed
+  // groups:read scope for private channels. Bot just needs to be a member.
   try {
     await slack.chat.postMessage({
-      channel: channel.id!,
+      channel: `#${channelName}`,
       text: message,
       as_user: true,
     });
