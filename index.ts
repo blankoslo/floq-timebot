@@ -9,26 +9,34 @@ const slack = new WebClient(process.env.SLACK_API_TOKEN || "");
 const DRY_RUN = process.env.DRY_RUN === "true";
 const FLOQ_TIMESTAMP_URL =
   process.env.FLOQ_TIMESTAMP_URL || "https://inni.blank.no/timestamp/";
-// When set, only this employee's email will receive a message — useful for
-// previewing how a real Slack render looks without spamming everyone.
+// When set, only this employee's data is processed (filters the target
+// list) — useful for previewing how a real Slack render looks without
+// spamming everyone.
 const TEST_USER_EMAIL = process.env.TEST_USER_EMAIL?.toLowerCase().trim();
-// Ignore tiny deltas so a 7,45h vs 7,5h day doesn't trigger a notification.
-const REPORT_TOLERANCE_HOURS = 0.25;
+// When set, all Slack DMs are routed to this address instead of the
+// employee's own. Lets you impersonate someone (combined with
+// TEST_USER_EMAIL) to see their exact message rendered in your own DM.
+const TEST_USER_SLACK_EMAIL = process.env.TEST_USER_SLACK_EMAIL?.toLowerCase().trim();
+// Ignore small deltas so a 7 t vs 7,5 t day doesn't trigger a notification.
+const REPORT_TOLERANCE_HOURS = 0.5;
 
 moment.locale("nb");
 
-// Project codes that represent absence, not work. Mirrors
-// floq-timetracker-v2/src/constants/codes.ts.
-const ABSENCE_LABEL: Record<string, string> = {
-  FER1000: "Ferie",
-  SYK1000: "Egenmelding",
-  SYK1001: "Sykmelding",
-  SYK1002: "Sykt barn",
-  AVS: "Avspasering",
-  PER1000: "Permisjon m/lønn",
-  PER1001: "Permisjon u/lønn",
-  PER1002: "Foreldrepermisjon",
-};
+// Bonus tiers and FG thresholds — mirrors floq-timetracker-v2/src/constants/bonus.ts.
+const FG_THRESHOLD_90 = 90;
+const FG_THRESHOLD_95 = 95;
+const BONUS_FG90 = 500;
+const BONUS_FG90_TENURE = 750;
+const BONUS_FG95 = 750;
+const BONUS_FG95_TENURE = 1000;
+// Project codes that don't affect FG — mirrors nonFgCodes from frontend.
+const NON_FG_PROJECT_CODES = ["PER1005", "REK1010"];
+
+// Note: we used to hardcode an absence-code list here, but it was both
+// incomplete (missed several codes Floq counts as unavailable) and wrong
+// for PER1000 (Permisjon m/lønn — counted as non-billable, not absence).
+// Categorization now reads `billable` from /projects instead, so the
+// API is the single source of truth.
 
 // === Types ===
 type TimeTrackingStatusRow = {
@@ -44,14 +52,30 @@ type TimeTrackingStatusRow = {
 };
 
 type EmployeeRow = { id: number; email: string };
-type TimeEntryRow = {
-  id: number;
-  project: string;
-  minutes: number;
-  date: string;
-};
 type HolidayRow = { date: string; name: string };
-type ProjectRow = { id: string; name: string };
+type AbsenceRow = { date: string; employee_id: number; reason: string };
+type ProjectRow = {
+  id: string;
+  name: string;
+  // From floq: "billable" | "non_billable" | "unavailable" (verified via API)
+  billable: string;
+};
+type FGRangeRow = { billable_hours: number; available_hours: number };
+type WeeklyFGRow = {
+  week_number: number;
+  available_hours: number;
+  billable_hours: number;
+};
+type TenureRoleRow = { employee_id: number };
+// entries_sums_for_employee_with_project view: project name + hours already
+// aggregated per (work_date, project). Use this instead of /time_entry,
+// which is event-based (multiple rows per change → naive sums overcount).
+type ProjectHoursPerDayRow = {
+  work_date: string;
+  employee_id: number;
+  project: string;
+  hours: number;
+};
 
 type DayStatus =
   | "complete" //  ≥ 7,5 t with at least some work time
@@ -73,6 +97,17 @@ type DayBreakdown = {
 // === API helpers ===
 const apiToken = () =>
   jwt.sign({ role: "root" }, process.env.API_JWT_SECRET || "dev-secret-shhh");
+
+// Pick which Slack user to DM. Honors TEST_USER_SLACK_EMAIL override so we
+// can impersonate someone else's data while having the message land in our
+// own inbox.
+function pickSlackRecipient(
+  slackUsers: Array<{ id?: string; name?: string; profile?: { email?: string } }>,
+  originalEmail: string
+): { id?: string; name?: string; profile?: { email?: string } } | undefined {
+  const targetEmail = (TEST_USER_SLACK_EMAIL ?? originalEmail).toLowerCase();
+  return slackUsers.find((u) => u.profile?.email?.toLowerCase() === targetEmail);
+}
 
 async function apiGet<T>(path: string): Promise<T> {
   const res = await fetch(`${apiUri}${path}`, {
@@ -112,22 +147,34 @@ async function apiPost<T>(path: string, body: unknown): Promise<T> {
 const isFirstOfMonth =
   process.env.IS_FIRST_OF_MONTH === "true" || moment().date() === 1;
 const isMonday = process.env.IS_MONDAY === "true" || moment().day() === 1;
+const isTuesday = process.env.IS_TUESDAY === "true" || moment().day() === 2;
 
+// Monday flow: covers all of last week (Mon–Sun). The IS_FIRST_OF_MONTH
+// legacy branch covers a partial current week when the job runs on a non-
+// Monday 1st-of-month — only relevant if the schedule ever moves off
+// Monday. Tuesday/Monthly flows have their own date helpers below.
 const getStartAndEndDate = () => {
   let startDate: moment.Moment;
   let endDate: moment.Moment;
 
   if (isFirstOfMonth && !isMonday) {
-    // First-of-month run that isn't a Monday: cover the current partial week
     startDate = moment().startOf("isoWeek");
     endDate = moment().subtract(1, "day");
   } else {
-    // Standard Monday run: cover all of last week
     startDate = moment().subtract(1, "week").startOf("isoWeek");
     endDate = moment().subtract(1, "week").endOf("isoWeek");
   }
   return { startDate, endDate };
 };
+
+// Tuesday flow always wants previous calendar week (Mon–Sun before today),
+// regardless of date-of-month. Sharing getStartAndEndDate() with Monday led
+// to a bug where IS_FIRST_OF_MONTH=true mangled the period to "this Mon
+// only".
+const getLastFullWeekRange = () => ({
+  startDate: moment().subtract(1, "week").startOf("isoWeek"),
+  endDate: moment().subtract(1, "week").endOf("isoWeek"),
+});
 
 // === Data fetching ===
 
@@ -153,21 +200,18 @@ async function fetchEmployeeIdByEmail(email: string): Promise<number | null> {
   }
 }
 
-async function fetchTimeEntries(
-  employeeId: number,
-  startDate: string,
-  endDate: string
-): Promise<TimeEntryRow[]> {
+async function fetchProjectInfoMap(): Promise<Map<string, ProjectRow>> {
+  // The view returns project IDs (e.g. "AID1000"); fetch human-readable
+  // names and the billable category so we can split work vs absence in
+  // the project breakdown.
   try {
-    return await apiGet<TimeEntryRow[]>(
-      `/time_entry?select=id,project,minutes,date&employee=eq.${employeeId}&date=gte.${startDate}&date=lte.${endDate}`
+    const projects = await apiGet<ProjectRow[]>(
+      "/projects?select=id,name,billable"
     );
+    return new Map(projects.map((p) => [p.id, p]));
   } catch (err) {
-    console.error(
-      `Failed to fetch time entries for employee ${employeeId}:`,
-      err
-    );
-    return [];
+    console.error("Failed to fetch projects:", err);
+    return new Map();
   }
 }
 
@@ -185,16 +229,167 @@ async function fetchHolidays(
   }
 }
 
-async function fetchProjectNameMap(): Promise<Map<string, string>> {
+async function fetchAllAbsencesForWeek(
+  startDate: string,
+  endDate: string
+): Promise<AbsenceRow[]> {
   try {
-    const projects = await apiGet<ProjectRow[]>(
-      "/projects?select=id,name"
+    return await apiGet<AbsenceRow[]>(
+      `/absence?date=gte.${startDate}&date=lte.${endDate}`
     );
-    return new Map(projects.map((p) => [p.id, p.name]));
   } catch (err) {
-    console.error("Failed to fetch projects:", err);
+    console.error("Failed to fetch absences:", err);
+    return [];
+  }
+}
+
+async function fetchAllEmployees(): Promise<EmployeeRow[]> {
+  try {
+    return await apiGet<EmployeeRow[]>("/employees?select=id,email");
+  } catch (err) {
+    console.error("Failed to fetch employees:", err);
+    return [];
+  }
+}
+
+async function fetchTenureRoleEmployeeIds(
+  start: string,
+  end: string
+): Promise<Set<number>> {
+  // Single bulk call to find which employees hold the Fagleder tenure role
+  // for any part of the given period. Mirrors getHasTenureRole but for all
+  // employees in one query.
+  try {
+    const rows = await apiGet<TenureRoleRow[]>(
+      `/employee_tenure_role?select=employee_id&tenure_role=eq.Fagleder&from_date=lte.${end}&or=(to_date.is.null,to_date.gte.${start})`
+    );
+    return new Set(rows.map((r) => r.employee_id));
+  } catch (err) {
+    console.error("Failed to fetch tenure roles:", err);
+    return new Set();
+  }
+}
+
+async function fetchEmployeeWeeklyFG(
+  employeeId: number,
+  year: number
+): Promise<Map<number, { billable: number; available: number }>> {
+  try {
+    const rows = await apiGet<WeeklyFGRow[]>(
+      `/rpc/employee_weekly_fg?year=${year}&emp_id=${employeeId}`
+    );
+    return new Map(
+      rows.map((r) => [
+        r.week_number,
+        { billable: r.billable_hours, available: r.available_hours },
+      ])
+    );
+  } catch (err) {
+    console.error(`Failed to fetch weekly FG for ${employeeId}:`, err);
     return new Map();
   }
+}
+
+async function fetchExcludedFGHoursByWeek(
+  employeeId: number,
+  year: number
+): Promise<Map<number, number>> {
+  // Hours on non-FG codes (PER1005, REK1010), keyed by ISO week. These are
+  // subtracted from `available_hours` before bonus is computed.
+  const codes = NON_FG_PROJECT_CODES.join(",");
+  try {
+    const data = await apiGet<{ minutes: number; date: string }[]>(
+      `/time_entry?select=minutes,date&employee=eq.${employeeId}&project=in.(${codes})&date=gte.${year}-01-01&date=lte.${year}-12-31`
+    );
+    const map = new Map<number, number>();
+    for (const { minutes, date } of data) {
+      const week = moment(`${date}T12:00:00`).isoWeek();
+      map.set(week, (map.get(week) ?? 0) + minutes / 60);
+    }
+    return map;
+  } catch (err) {
+    console.error(`Failed to fetch excluded FG hours for ${employeeId}:`, err);
+    return new Map();
+  }
+}
+
+async function fetchProjectHoursPerDay(
+  employeeId: number,
+  startDate: string,
+  endDate: string
+): Promise<ProjectHoursPerDayRow[]> {
+  // Note: RPC parameters are `from_date`/`to_date`, NOT start_date/end_date
+  // (verified via PostgREST hint when called with wrong names).
+  try {
+    return await apiGet<ProjectHoursPerDayRow[]>(
+      `/rpc/entries_sums_for_employee_with_project?employee_id=${employeeId}&from_date=${startDate}&to_date=${endDate}`
+    );
+  } catch (err) {
+    console.error(
+      `Failed to fetch project hours for ${employeeId}:`,
+      err
+    );
+    return [];
+  }
+}
+
+async function fetchFGForRange(
+  employeeId: number,
+  start: string,
+  end: string
+): Promise<{ billable: number; available: number }> {
+  try {
+    const rows = await apiGet<FGRangeRow[]>(
+      `/rpc/fg_for_employee?emp_id=${employeeId}&start_date=${start}&end_date=${end}`
+    );
+    const billable = rows.reduce((s, r) => s + r.billable_hours, 0);
+    const available = rows.reduce((s, r) => s + r.available_hours, 0);
+    return { billable, available };
+  } catch (err) {
+    console.error(`Failed to fetch FG for ${employeeId}:`, err);
+    return { billable: 0, available: 0 };
+  }
+}
+
+// === Bonus / FG calculations (ported from floq-timetracker-v2/lib/statsCalculations.ts) ===
+
+function fgBonusAmount(pct: number, hasTenureRole: boolean): number {
+  if (pct >= FG_THRESHOLD_95)
+    return hasTenureRole ? BONUS_FG95_TENURE : BONUS_FG95;
+  if (pct >= FG_THRESHOLD_90)
+    return hasTenureRole ? BONUS_FG90_TENURE : BONUS_FG90;
+  return 0;
+}
+
+function calcMonthlyBonus(
+  weeklyFG: Map<number, { billable: number; available: number }>,
+  excludedByWeek: Map<number, number>,
+  monthStart: moment.Moment,
+  hasTenureRole: boolean
+): number {
+  // Iterate every day of the month and collect unique ISO weeks. For each
+  // week, adjust available_hours by the excluded non-FG hours, compute FG%,
+  // and sum the bonus tier.
+  const weeksInMonth = new Set<number>();
+  const cursor = monthStart.clone();
+  const month = monthStart.month();
+  while (cursor.month() === month) {
+    weeksInMonth.add(cursor.isoWeek());
+    cursor.add(1, "day");
+  }
+  let total = 0;
+  for (const week of Array.from(weeksInMonth)) {
+    const data = weeklyFG.get(week);
+    if (!data) continue;
+    const adjustedAvailable = Math.max(
+      0,
+      data.available - (excludedByWeek.get(week) ?? 0)
+    );
+    if (adjustedAvailable <= 0) continue;
+    const pct = (data.billable / adjustedAvailable) * 100;
+    total += fgBonusAmount(pct, hasTenureRole);
+  }
+  return total;
 }
 
 // === Per-day breakdown ===
@@ -206,42 +401,46 @@ const STANDARD_WORKDAY_HOURS = 7.5;
 function buildPerDayBreakdown(
   startDate: moment.Moment,
   endDate: moment.Moment,
-  entries: TimeEntryRow[],
+  rows: ProjectHoursPerDayRow[],
   holidays: HolidayRow[],
-  projectNames: Map<string, string>
+  projectInfo: Map<string, ProjectRow>
 ): DayBreakdown[] {
-  // Aggregate per date: we treat absence entries and work entries as both
-  // counting toward "registered time" so e.g. a 6 t Permisjon u/lønn day
-  // surfaces as a 🟡 partial (since 6 < 7,5) rather than being hidden as
-  // ⚪ Permisjon (which would mask a missing 1,5 t).
+  // Aggregate per date: absence entries and work entries both count toward
+  // "registered time" so e.g. 6 t Permisjon u/lønn shows as ⚠️ partial
+  // rather than being hidden as ☑️ Permisjon (masking a missing 1,5 t).
   type DayAgg = {
-    totalMinutes: number;
-    workMinutes: number;
-    absenceMinutes: number;
-    projectCodes: string[]; // ordered, deduped
+    totalHours: number;
+    workHours: number;
+    absenceHours: number;
+    projectCodes: string[]; // ordered, deduped — resolved to names below
   };
   const byDate = new Map<string, DayAgg>();
-  for (const e of entries) {
-    let cur = byDate.get(e.date);
+  for (const r of rows) {
+    let cur = byDate.get(r.work_date);
     if (!cur) {
       cur = {
-        totalMinutes: 0,
-        workMinutes: 0,
-        absenceMinutes: 0,
+        totalHours: 0,
+        workHours: 0,
+        absenceHours: 0,
         projectCodes: [],
       };
-      byDate.set(e.date, cur);
+      byDate.set(r.work_date, cur);
     }
-    cur.totalMinutes += e.minutes;
-    if (e.project in ABSENCE_LABEL) {
-      cur.absenceMinutes += e.minutes;
+    cur.totalHours += r.hours;
+    // The view's `project` field is the project ID (code) e.g. "AID1000",
+    // "FER1000". A day counts as absence only if the project's billable
+    // field says "unavailable" — Permisjon m/lønn is "non_billable"
+    // (i.e. work), not absence.
+    const billable = projectInfo.get(r.project)?.billable;
+    if (billable === "unavailable") {
+      cur.absenceHours += r.hours;
     } else {
-      cur.workMinutes += e.minutes;
+      cur.workHours += r.hours;
     }
-    // Ignore entries with 0 minutes (UI markers without an actual entry —
-    // these are what cause "Ferie shown but not registered" cases).
-    if (e.minutes > 0 && !cur.projectCodes.includes(e.project)) {
-      cur.projectCodes.push(e.project);
+    // Skip zero-hour entries (UI markers, e.g. "Ferie marked but not
+    // registered") and dedupe by code per day.
+    if (r.hours > 0 && !cur.projectCodes.includes(r.project)) {
+      cur.projectCodes.push(r.project);
     }
   }
 
@@ -260,8 +459,8 @@ function buildPerDayBreakdown(
   for (const d of allDays) {
     const ds = d.format("YYYY-MM-DD");
     const agg = byDate.get(ds);
-    const totalHours = (agg?.totalMinutes ?? 0) / 60;
-    const workHours = (agg?.workMinutes ?? 0) / 60;
+    const totalHours = agg?.totalHours ?? 0;
+    const workHours = agg?.workHours ?? 0;
     const holidayName = holidayByDate.get(ds);
     const weekend = isWeekend(d);
 
@@ -291,11 +490,8 @@ function buildPerDayBreakdown(
     }
 
     const projects = agg
-      ? agg.projectCodes.map(
-          (code) => ABSENCE_LABEL[code] ?? projectNames.get(code) ?? code
-        )
+      ? agg.projectCodes.map((code) => projectInfo.get(code)?.name ?? code)
       : [];
-
     result.push({
       date: ds,
       status,
@@ -322,6 +518,13 @@ function formatHoursShort(n: number): string {
   // Strip trailing ",0" — used in the headline where "30 / 30 t" reads
   // cleaner than "30,0 / 30,0 t".
   return formatHours(n).replace(/,0$/, "");
+}
+
+function formatSignedHours(n: number): string {
+  // For deltas (flexitime change). Round to zero when within rounding error.
+  if (Math.abs(n) < 0.05) return "0 t";
+  const sign = n >= 0 ? "+" : "-";
+  return `${sign}${formatHours(Math.abs(n))} t`;
 }
 
 // Full Norwegian weekday names, used in the table view.
@@ -660,9 +863,9 @@ const notifySlackers = async () => {
   }
 
   // Fetch shared data once
-  const [holidays, projectNames, slackUsersResp] = await Promise.all([
+  const [holidays, projectInfo, slackUsersResp] = await Promise.all([
     fetchHolidays(startStr, endStr),
-    fetchProjectNameMap(),
+    fetchProjectInfoMap(),
     slack.users.list(),
   ]);
 
@@ -678,13 +881,17 @@ const notifySlackers = async () => {
       console.warn(`No employee_id for ${row.email}, skipping`);
       continue;
     }
-    const entries = await fetchTimeEntries(employeeId, startStr, endStr);
+    const projectRows = await fetchProjectHoursPerDay(
+      employeeId,
+      startStr,
+      endStr
+    );
     const days = buildPerDayBreakdown(
       startDate,
       endDate,
-      entries,
+      projectRows,
       holidays,
-      projectNames
+      projectInfo
     );
 
     // Headline totals sum across all surviving days. The filter inside
@@ -702,7 +909,7 @@ const notifySlackers = async () => {
     const missing = Math.max(0, totalExpected - totalActual);
     const hasIssues = hasEmpty || missing > REPORT_TOLERANCE_HOURS;
 
-    const targetUser = slackUsers.find((u) => u.profile?.email === row.email);
+    const targetUser = pickSlackRecipient(slackUsers, row.email);
     if (!targetUser) {
       console.error(`No Slack user found for ${row.email}`);
       continue;
@@ -785,11 +992,578 @@ const notifyAdminAboutOvertime = async () => {
   }
 };
 
-const main = async () => {
-  const results = await Promise.allSettled([
-    notifySlackers(),
-    notifyAdminAboutOvertime(),
+// === Tuesday: follow-up nudge to stragglers ===
+
+function buildLateRegisterMessage(
+  startDate: moment.Moment,
+  endDate: moment.Moment,
+  missingHours: number,
+  missingDays: number
+): { text: string; blocks: Array<Record<string, unknown>> } {
+  const weekNumber = startDate.isoWeek();
+  const fridayOfWeek = startDate.clone().add(4, "days");
+  const displayEnd = endDate.isBefore(fridayOfWeek) ? endDate : fridayOfWeek;
+  const sameMonth = startDate.month() === displayEnd.month();
+  const firstDate = sameMonth
+    ? startDate.format("D.")
+    : startDate.format("D. MMMM");
+  const lastDate = displayEnd.format("D. MMMM");
+  const periodLabel = `uke ${weekNumber} (${firstDate}–${lastDate})`;
+
+  const hoursLabel = `*${formatHoursShort(missingHours)} time${missingHours === 1 ? "" : "r"}*`;
+  // The day count comes from the API's unregistered_days, which only counts
+  // fully empty workdays. Drop the "fordelt på N dager" clause when it's 0
+  // (someone with only partial days) to avoid the awkward "0 dager".
+  const daysClause =
+    missingDays > 0
+      ? ` fordelt på ${missingDays === 1 ? "*1 dag*" : `*${missingDays} dager*`}`
+      : "";
+
+  const message =
+    `Du mangler fortsatt ${hoursLabel}${daysClause} for *${periodLabel}*. ` +
+    `Husk at avspasering skal markeres i fraværskalender og at ferie- og permisjonsdager også skal timeføres. ` +
+    `Ser du over og evt. fører resten? 🙏`;
+
+  const text =
+    message.replace(/\*/g, "") +
+    `\n\nÅpne timeføring: ${FLOQ_TIMESTAMP_URL}`;
+
+  const blocks: Array<Record<string, unknown>> = [
+    {
+      type: "section",
+      text: { type: "mrkdwn", text: message },
+    },
+    {
+      type: "actions",
+      elements: [
+        {
+          type: "button",
+          text: { type: "plain_text", text: "Åpne timeføring i Floq" },
+          url: FLOQ_TIMESTAMP_URL,
+        },
+      ],
+    },
+  ];
+
+  return { text, blocks };
+}
+
+const notifyLateRegisterers = async () => {
+  const { startDate, endDate } = getLastFullWeekRange();
+  const startStr = startDate.format("YYYY-MM-DD");
+  const endStr = endDate.format("YYYY-MM-DD");
+
+  console.info(`Tuesday follow-up for ${startStr} → ${endStr}`);
+
+  let rows: TimeTrackingStatusRow[];
+  try {
+    rows = await fetchTimeTrackingStatus(startDate, endDate);
+  } catch (err) {
+    console.error("time_tracking_status failed:", err);
+    return;
+  }
+  if (!Array.isArray(rows)) {
+    console.error("time_tracking_status did not return an array:", rows);
+    return;
+  }
+
+  // Only nag the ones who *still* have a shortfall after Monday's reminder.
+  let targets = rows.filter((r) => {
+    if (r.available_hours <= 0) return false;
+    const registered = r.billable_hours + r.non_billable_hours;
+    return registered < r.available_hours - REPORT_TOLERANCE_HOURS;
+  });
+  console.info(`${targets.length} still below available_hours`);
+
+  if (TEST_USER_EMAIL) {
+    const before = targets.length;
+    targets = targets.filter(
+      (r) => r.email.toLowerCase() === TEST_USER_EMAIL
+    );
+    console.info(
+      `TEST_USER_EMAIL=${TEST_USER_EMAIL} — filtered ${before} → ${targets.length} target(s)`
+    );
+  }
+
+  if (targets.length === 0) {
+    console.info("Nothing to nag on Tuesday.");
+    return;
+  }
+
+  // Fetch absence calendar + employees + slack users in parallel. Bulk
+  // queries instead of per-employee loops.
+  const [allAbsences, allEmployees, slackUsersResp] = await Promise.all([
+    fetchAllAbsencesForWeek(startStr, endStr),
+    fetchAllEmployees(),
+    slack.users.list(),
   ]);
+
+  const slackUsers = slackUsersResp.members;
+  if (!slackUsers) {
+    console.error("No slack users in response");
+    return;
+  }
+
+  // Build lookup: email → employee_id (lowercased emails)
+  const idByEmail = new Map(
+    allEmployees.map((e) => [e.email.toLowerCase(), e.id])
+  );
+
+  // Build lookup: employee_id → number of weekday absence calendar entries
+  // (Mon-Fri) within the period.
+  const absenceWeekdaysByEmployee = new Map<number, number>();
+  for (const a of allAbsences) {
+    const day = moment(a.date).day();
+    if (day < 1 || day > 5) continue; // skip weekend absence entries
+    absenceWeekdaysByEmployee.set(
+      a.employee_id,
+      (absenceWeekdaysByEmployee.get(a.employee_id) ?? 0) + 1
+    );
+  }
+
+  for (const row of targets) {
+    const apiMissing =
+      row.available_hours - row.billable_hours - row.non_billable_hours;
+
+    const employeeId = idByEmail.get(row.email.toLowerCase());
+    const absenceDays = employeeId
+      ? absenceWeekdaysByEmployee.get(employeeId) ?? 0
+      : 0;
+    const toleratedByAbsence = absenceDays * STANDARD_WORKDAY_HOURS;
+
+    // If marked-absence days fully explain the gap (within tolerance), skip.
+    if (apiMissing <= toleratedByAbsence + REPORT_TOLERANCE_HOURS) {
+      console.info(
+        `Skipping ${row.email}: ${absenceDays} fraværskalender-dag(er) forklarer gapet på ${formatHours(apiMissing)} t`
+      );
+      continue;
+    }
+
+    // Subtract the absence-explained portion from both totals shown in the
+    // message so the user sees the remaining real gap.
+    const missingHours = apiMissing - toleratedByAbsence;
+    const missingDays = Math.max(0, row.unregistered_days - absenceDays);
+
+    const targetUser = pickSlackRecipient(slackUsers, row.email);
+    if (!targetUser) {
+      console.error(`No Slack user found for ${row.email}`);
+      continue;
+    }
+
+    const { text, blocks } = buildLateRegisterMessage(
+      startDate,
+      endDate,
+      missingHours,
+      missingDays
+    );
+
+    console.info(
+      `Nudging @${targetUser.name} (${row.email}) — still missing ${formatHours(missingHours)} t, ${missingDays} empty day(s) (after ${absenceDays} absence-cal day(s) tolerance)`
+    );
+
+    if (DRY_RUN) {
+      console.info("DRY_RUN — message preview:\n" + text);
+      continue;
+    }
+
+    try {
+      await slack.chat.postMessage({
+        channel: targetUser.id!,
+        text,
+        blocks: blocks as any,
+        as_user: true,
+      });
+      console.info(`Sent to @${targetUser.name}`);
+    } catch (err) {
+      console.error(`Failed to send to @${targetUser.name}:`, err);
+    }
+  }
+};
+
+// === First-of-month: monthly recap ===
+
+type ProjectCategory = "billable" | "non_billable" | "absence";
+type ProjectHours = {
+  name: string;
+  hours: number;
+  category: ProjectCategory;
+};
+
+function aggregateProjectHours(
+  rows: ProjectHoursPerDayRow[],
+  projectInfo: Map<string, ProjectRow>
+): ProjectHours[] {
+  // Collapse across dates per project ID, then resolve name and category
+  // via the projects map. Categories drive how rows are grouped in the
+  // table and whether they're counted as "work" or "absence".
+  const totals = new Map<string, number>();
+  for (const r of rows) {
+    if (r.hours <= 0) continue;
+    totals.set(r.project, (totals.get(r.project) ?? 0) + r.hours);
+  }
+  const result: ProjectHours[] = [];
+  for (const [code, hours] of Array.from(totals)) {
+    const info = projectInfo.get(code);
+    let category: ProjectCategory;
+    if (info?.billable === "unavailable") {
+      category = "absence";
+    } else if (info?.billable === "billable") {
+      category = "billable";
+    } else {
+      // Defaults to non_billable when projects.billable says "non_billable"
+      // or when the project is missing from /projects entirely.
+      category = "non_billable";
+    }
+    const name = info?.name ?? code;
+    result.push({ name, hours, category });
+  }
+  // Sort: work projects first (billable, then non_billable), then absence.
+  // Within each category, biggest hours at the top.
+  const order: Record<ProjectCategory, number> = {
+    billable: 0,
+    non_billable: 1,
+    absence: 2,
+  };
+  result.sort((a, b) => {
+    if (a.category !== b.category) return order[a.category] - order[b.category];
+    return b.hours - a.hours;
+  });
+  return result;
+}
+
+function buildProjectTableBlock(
+  projects: ProjectHours[],
+  availableHours: number
+): Record<string, unknown> {
+  const headerRow = [headerCell("Prosjekt"), headerCell("Timer")];
+  const workProjects = projects.filter((p) => p.category !== "absence");
+  const absenceProjects = projects.filter((p) => p.category === "absence");
+
+  const workRows = workProjects.map((p) => [
+    textCell(p.name),
+    textCell(`${formatHours(p.hours)} t`),
+  ]);
+  const workTotal = workProjects.reduce((s, p) => s + p.hours, 0);
+  const sumRow = [
+    headerCell("Sum arbeid"),
+    headerCell(`${formatHours(workTotal)} t`),
+  ];
+  // Endring i fleksitid: work delta vs expected. Positive = built up
+  // flex balance, negative = used flex / owe time. Only show when we
+  // know what "expected" is (availableHours > 0).
+  const flexChange = workTotal - availableHours;
+  const flexRow =
+    availableHours > 0
+      ? [
+          headerCell("Endring i fleksitid"),
+          headerCell(formatSignedHours(flexChange)),
+        ]
+      : null;
+  const absenceRows = absenceProjects.map((p) => [
+    textCell(p.name),
+    textCell(`${formatHours(p.hours)} t`),
+  ]);
+
+  // Rows: work → Sum arbeid → Endring i fleksitid → absences.
+  const rows: Array<Array<Record<string, unknown>>> = [headerRow, ...workRows];
+  if (workProjects.length > 0) {
+    rows.push(sumRow);
+    if (flexRow) rows.push(flexRow);
+  }
+  rows.push(...absenceRows);
+
+  return {
+    type: "table",
+    column_settings: [
+      { align: "left", is_wrapped: true },
+      { align: "right" },
+    ],
+    rows,
+  };
+}
+
+function buildMonthlyRecapMessage(params: {
+  monthLabel: string;
+  missingHours: number; // 0 if no shortfall
+  missingDays: number;
+  fgPct: number | null;
+  billableHours: number;
+  availableHours: number;
+  bonusKr: number;
+  projects: ProjectHours[];
+}): { text: string; blocks: Array<Record<string, unknown>> } {
+  const {
+    monthLabel,
+    missingHours,
+    missingDays,
+    fgPct,
+    billableHours,
+    availableHours,
+    bonusKr,
+    projects,
+  } = params;
+
+  const workTotal = projects
+    .filter((p) => p.category !== "absence")
+    .reduce((s, p) => s + p.hours, 0);
+
+  const introLine = `Her er månedsoppsummeringen din for *${monthLabel}*.`;
+
+  let shortfallLine: string | null = null;
+  if (missingHours > REPORT_TOLERANCE_HOURS) {
+    const hoursLabel = `*${formatHoursShort(missingHours)} time${missingHours === 1 ? "" : "r"}*`;
+    const daysClause =
+      missingDays > 0
+        ? ` fordelt på ${missingDays === 1 ? "*1 dag*" : `*${missingDays} dager*`}`
+        : "";
+    shortfallLine =
+      `Du mangler fortsatt ${hoursLabel}${daysClause} for *${monthLabel}*. ` +
+      `Husk at avspasering skal markeres i fraværskalender og at ferie- og permisjonsdager også skal timeføres. ` +
+      `Ser du over og evt. fører resten? 🙏`;
+  }
+
+  const statsLines: string[] = [];
+  if (fgPct !== null && availableHours > 0) {
+    statsLines.push(
+      `*Faktureringsgrad:* ${formatHours(fgPct)} %  (${formatHours(billableHours)} av ${formatHours(availableHours)} t)`
+    );
+  }
+  statsLines.push(`*Bonus i ${monthLabel}:* ${bonusKr.toLocaleString("nb-NO")} kr`);
+
+  // Plain-text fallback
+  const textLines = [introLine.replace(/\*/g, "")];
+  if (shortfallLine) {
+    textLines.push("", shortfallLine.replace(/\*/g, ""));
+  }
+  textLines.push("", ...statsLines.map((l) => l.replace(/\*/g, "")));
+  textLines.push("", "Timer per prosjekt:");
+  for (const p of projects) {
+    textLines.push(`  ${p.name}: ${formatHours(p.hours)} t`);
+    // Insert sum-arbeid + endring i fleksitid after the last non-absence row.
+    const isLastWorkRow =
+      p.category !== "absence" &&
+      (projects.indexOf(p) === projects.length - 1 ||
+        projects[projects.indexOf(p) + 1]?.category === "absence");
+    if (isLastWorkRow) {
+      textLines.push(`  Sum arbeid: ${formatHours(workTotal)} t`);
+      if (availableHours > 0) {
+        textLines.push(
+          `  Endring i fleksitid: ${formatSignedHours(workTotal - availableHours)}`
+        );
+      }
+    }
+  }
+  textLines.push("", `Åpne timeføring: ${FLOQ_TIMESTAMP_URL}`);
+  const text = textLines.join("\n");
+
+  const blocks: Array<Record<string, unknown>> = [
+    { type: "section", text: { type: "mrkdwn", text: introLine } },
+  ];
+  if (shortfallLine) {
+    blocks.push({
+      type: "section",
+      text: { type: "mrkdwn", text: shortfallLine },
+    });
+  }
+  blocks.push({
+    type: "section",
+    text: { type: "mrkdwn", text: statsLines.join("\n") },
+  });
+  blocks.push({
+    type: "actions",
+    elements: [
+      {
+        type: "button",
+        text: { type: "plain_text", text: "Åpne timeføring i Floq" },
+        url: FLOQ_TIMESTAMP_URL,
+      },
+    ],
+  });
+  blocks.push(buildProjectTableBlock(projects, availableHours));
+
+  return { text, blocks };
+}
+
+const notifyMonthlyRecap = async () => {
+  // Previous calendar month — e.g. on June 1 covers May 1 → May 31.
+  const monthStart = moment().subtract(1, "month").startOf("month");
+  const monthEnd = monthStart.clone().endOf("month");
+  const startStr = monthStart.format("YYYY-MM-DD");
+  const endStr = monthEnd.format("YYYY-MM-DD");
+  const monthLabel = monthStart.format("MMMM YYYY");
+  const year = monthStart.year();
+
+  console.info(`Monthly recap for ${monthLabel} (${startStr} → ${endStr})`);
+
+  let rows: TimeTrackingStatusRow[];
+  try {
+    rows = await fetchTimeTrackingStatus(monthStart, monthEnd);
+  } catch (err) {
+    console.error("time_tracking_status failed:", err);
+    return;
+  }
+  if (!Array.isArray(rows)) {
+    console.error("time_tracking_status did not return an array:", rows);
+    return;
+  }
+
+  let targets = rows.filter((r) => r.available_hours > 0);
+  console.info(`${targets.length} employees with available_hours > 0`);
+
+  if (TEST_USER_EMAIL) {
+    const before = targets.length;
+    targets = targets.filter(
+      (r) => r.email.toLowerCase() === TEST_USER_EMAIL
+    );
+    console.info(
+      `TEST_USER_EMAIL=${TEST_USER_EMAIL} — filtered ${before} → ${targets.length} target(s)`
+    );
+  }
+
+  if (targets.length === 0) {
+    console.info("Nothing to send for monthly recap.");
+    return;
+  }
+
+  const [
+    allEmployees,
+    allAbsences,
+    projectInfo,
+    tenureRoleIds,
+    slackUsersResp,
+  ] = await Promise.all([
+    fetchAllEmployees(),
+    fetchAllAbsencesForWeek(startStr, endStr),
+    fetchProjectInfoMap(),
+    fetchTenureRoleEmployeeIds(startStr, endStr),
+    slack.users.list(),
+  ]);
+
+  const slackUsers = slackUsersResp.members;
+  if (!slackUsers) {
+    console.error("No slack users in response");
+    return;
+  }
+
+  const idByEmail = new Map(
+    allEmployees.map((e) => [e.email.toLowerCase(), e.id])
+  );
+
+  const absenceWeekdaysByEmployee = new Map<number, number>();
+  for (const a of allAbsences) {
+    const day = moment(a.date).day();
+    if (day < 1 || day > 5) continue;
+    absenceWeekdaysByEmployee.set(
+      a.employee_id,
+      (absenceWeekdaysByEmployee.get(a.employee_id) ?? 0) + 1
+    );
+  }
+
+  for (const row of targets) {
+    const employeeId = idByEmail.get(row.email.toLowerCase());
+    if (!employeeId) {
+      console.warn(`No employee_id for ${row.email}, skipping`);
+      continue;
+    }
+    const hasTenureRole = tenureRoleIds.has(employeeId);
+
+    const [weeklyFG, excludedByWeek, fgRange, projectRows] = await Promise.all([
+      fetchEmployeeWeeklyFG(employeeId, year),
+      fetchExcludedFGHoursByWeek(employeeId, year),
+      fetchFGForRange(employeeId, startStr, endStr),
+      fetchProjectHoursPerDay(employeeId, startStr, endStr),
+    ]);
+
+    const bonusKr = calcMonthlyBonus(
+      weeklyFG,
+      excludedByWeek,
+      monthStart,
+      hasTenureRole
+    );
+    const fgPct =
+      fgRange.available > 0 ? (fgRange.billable / fgRange.available) * 100 : null;
+
+    const projects = aggregateProjectHours(projectRows, projectInfo);
+
+    // Defensive: if FG indicates the employee did register hours but our
+    // project query came back empty, something went wrong (404, parse
+    // error, etc.). Skip rather than sending a misleading empty table.
+    if (
+      projects.length === 0 &&
+      (fgRange.billable > 0 || fgRange.available > 0)
+    ) {
+      console.warn(
+        `Skipping ${row.email}: empty project breakdown despite FG data (${fgRange.billable}/${fgRange.available} t) — likely a fetch failure.`
+      );
+      continue;
+    }
+
+    // Shortfall: same logic as Tuesday, with absence-calendar tolerance
+    const apiMissing =
+      row.available_hours - row.billable_hours - row.non_billable_hours;
+    const absenceDays = absenceWeekdaysByEmployee.get(employeeId) ?? 0;
+    const toleratedByAbsence = absenceDays * STANDARD_WORKDAY_HOURS;
+    const realMissing = Math.max(0, apiMissing - toleratedByAbsence);
+    const realMissingDays = Math.max(0, row.unregistered_days - absenceDays);
+
+    const targetUser = pickSlackRecipient(slackUsers, row.email);
+    if (!targetUser) {
+      console.error(`No Slack user found for ${row.email}`);
+      continue;
+    }
+
+    const { text, blocks } = buildMonthlyRecapMessage({
+      monthLabel,
+      missingHours: realMissing,
+      missingDays: realMissingDays,
+      fgPct,
+      billableHours: fgRange.billable,
+      availableHours: fgRange.available,
+      bonusKr,
+      projects,
+    });
+
+    console.info(
+      `Monthly recap → @${targetUser.name} (${row.email}) — FG ${fgPct?.toFixed(1) ?? "n/a"} %, bonus ${bonusKr} kr, ${projects.length} prosjekt(er), missing ${formatHours(realMissing)} t`
+    );
+
+    if (DRY_RUN) {
+      console.info("DRY_RUN — message preview:\n" + text);
+      continue;
+    }
+
+    try {
+      await slack.chat.postMessage({
+        channel: targetUser.id!,
+        text,
+        blocks: blocks as any,
+        as_user: true,
+      });
+      console.info(`Sent to @${targetUser.name}`);
+    } catch (err) {
+      console.error(`Failed to send to @${targetUser.name}:`, err);
+    }
+  }
+};
+
+const main = async () => {
+  const tasks: Promise<unknown>[] = [];
+  if (isFirstOfMonth) {
+    tasks.push(notifyMonthlyRecap());
+  }
+  if (isMonday) {
+    tasks.push(notifySlackers());
+    tasks.push(notifyAdminAboutOvertime());
+  } else if (isTuesday) {
+    tasks.push(notifyLateRegisterers());
+  } else if (!isFirstOfMonth) {
+    console.info(
+      `Today is weekday ${moment().day()} — nothing scheduled (run with IS_MONDAY, IS_TUESDAY or IS_FIRST_OF_MONTH=true to test).`
+    );
+    return;
+  }
+
+  const results = await Promise.allSettled(tasks);
   for (const r of results) {
     if (r.status === "rejected") console.error("Top-level error:", r.reason);
   }
