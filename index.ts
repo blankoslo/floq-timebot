@@ -148,6 +148,13 @@ const isFirstOfMonth =
   process.env.IS_FIRST_OF_MONTH === "true" || moment().date() === 1;
 const isMonday = process.env.IS_MONDAY === "true" || moment().day() === 1;
 const isTuesday = process.env.IS_TUESDAY === "true" || moment().day() === 2;
+// Monthly recap fires on the first Monday of a new month — by then every
+// "majority-of-days-in-previous-month" week has finished, so bonus + FG
+// calculations are stable. Auto-detect: today is a Monday and the date
+// is in 1–7 (i.e. it's the first Monday of the month).
+const isMonthlyRecap =
+  process.env.IS_MONTHLY_RECAP === "true" ||
+  (moment().day() === 1 && moment().date() <= 7);
 
 // Monday flow: covers all of last week (Mon–Sun). The IS_FIRST_OF_MONTH
 // legacy branch covers a partial current week when the job runs on a non-
@@ -367,16 +374,25 @@ function calcMonthlyBonus(
   monthStart: moment.Moment,
   hasTenureRole: boolean
 ): number {
-  // Iterate every day of the month and collect unique ISO weeks. For each
-  // week, adjust available_hours by the excluded non-FG hours, compute FG%,
-  // and sum the bonus tier.
-  const weeksInMonth = new Set<number>();
+  // A week "belongs" to this month if it has at least 4 of its 7 days
+  // (majority) in the month. That way border weeks aren't double-counted
+  // between adjacent months — each week contributes to exactly one
+  // month's bonus. The scheduler is expected to wait until the first
+  // Monday of the new month, so all majority-of-prev-month weeks are
+  // settled.
+  const daysPerWeek = new Map<number, number>();
   const cursor = monthStart.clone();
   const month = monthStart.month();
   while (cursor.month() === month) {
-    weeksInMonth.add(cursor.isoWeek());
+    const week = cursor.isoWeek();
+    daysPerWeek.set(week, (daysPerWeek.get(week) ?? 0) + 1);
     cursor.add(1, "day");
   }
+  const weeksInMonth = new Set<number>();
+  for (const [week, days] of Array.from(daysPerWeek)) {
+    if (days >= 4) weeksInMonth.add(week);
+  }
+
   let total = 0;
   for (const week of Array.from(weeksInMonth)) {
     const data = weeklyFG.get(week);
@@ -995,21 +1011,10 @@ const notifyAdminAboutOvertime = async () => {
 // === Tuesday: follow-up nudge to stragglers ===
 
 function buildLateRegisterMessage(
-  startDate: moment.Moment,
-  endDate: moment.Moment,
+  periodLabel: string,
   missingHours: number,
   missingDays: number
 ): { text: string; blocks: Array<Record<string, unknown>> } {
-  const weekNumber = startDate.isoWeek();
-  const fridayOfWeek = startDate.clone().add(4, "days");
-  const displayEnd = endDate.isBefore(fridayOfWeek) ? endDate : fridayOfWeek;
-  const sameMonth = startDate.month() === displayEnd.month();
-  const firstDate = sameMonth
-    ? startDate.format("D.")
-    : startDate.format("D. MMMM");
-  const lastDate = displayEnd.format("D. MMMM");
-  const periodLabel = `uke ${weekNumber} (${firstDate}–${lastDate})`;
-
   const hoursLabel = `*${formatHoursShort(missingHours)} time${missingHours === 1 ? "" : "r"}*`;
   // The day count comes from the API's unregistered_days, which only counts
   // fully empty workdays. Drop the "fordelt på N dager" clause when it's 0
@@ -1048,12 +1053,48 @@ function buildLateRegisterMessage(
   return { text, blocks };
 }
 
-const notifyLateRegisterers = async () => {
+type ShortfallPeriod = {
+  startDate: moment.Moment;
+  endDate: moment.Moment;
+  label: string; // user-facing, e.g. "uke 20 (11.–15. mai)" or "april 2026"
+  logTag: string; // for log lines, e.g. "Tuesday follow-up" or "Monthly nag"
+};
+
+function lastWeekShortfallPeriod(): ShortfallPeriod {
   const { startDate, endDate } = getLastFullWeekRange();
+  const weekNumber = startDate.isoWeek();
+  const fridayOfWeek = startDate.clone().add(4, "days");
+  const displayEnd = endDate.isBefore(fridayOfWeek) ? endDate : fridayOfWeek;
+  const sameMonth = startDate.month() === displayEnd.month();
+  const first = sameMonth
+    ? startDate.format("D.")
+    : startDate.format("D. MMMM");
+  const last = displayEnd.format("D. MMMM");
+  return {
+    startDate,
+    endDate,
+    label: `uke ${weekNumber} (${first}–${last})`,
+    logTag: "Tuesday follow-up",
+  };
+}
+
+function lastMonthShortfallPeriod(): ShortfallPeriod {
+  const startDate = moment().subtract(1, "month").startOf("month");
+  const endDate = startDate.clone().endOf("month");
+  return {
+    startDate,
+    endDate,
+    label: startDate.format("MMMM YYYY"),
+    logTag: "First-of-month nag",
+  };
+}
+
+const notifyLateRegisterers = async (period: ShortfallPeriod) => {
+  const { startDate, endDate, label: periodLabel, logTag } = period;
   const startStr = startDate.format("YYYY-MM-DD");
   const endStr = endDate.format("YYYY-MM-DD");
 
-  console.info(`Tuesday follow-up for ${startStr} → ${endStr}`);
+  console.info(`${logTag} for ${startStr} → ${endStr}`);
 
   let rows: TimeTrackingStatusRow[];
   try {
@@ -1151,8 +1192,7 @@ const notifyLateRegisterers = async () => {
     }
 
     const { text, blocks } = buildLateRegisterMessage(
-      startDate,
-      endDate,
+      periodLabel,
       missingHours,
       missingDays
     );
@@ -1548,17 +1588,27 @@ const notifyMonthlyRecap = async () => {
 
 const main = async () => {
   const tasks: Promise<unknown>[] = [];
-  if (isFirstOfMonth) {
-    tasks.push(notifyMonthlyRecap());
-  }
   if (isMonday) {
     tasks.push(notifySlackers());
     tasks.push(notifyAdminAboutOvertime());
-  } else if (isTuesday) {
-    tasks.push(notifyLateRegisterers());
-  } else if (!isFirstOfMonth) {
+  }
+  if (isTuesday) {
+    tasks.push(notifyLateRegisterers(lastWeekShortfallPeriod()));
+  }
+  if (isFirstOfMonth) {
+    // Nag stragglers about the *previous calendar month*. Reuses the
+    // Tuesday template, just with a different period.
+    tasks.push(notifyLateRegisterers(lastMonthShortfallPeriod()));
+  }
+  if (isMonthlyRecap) {
+    // Full digest with FG/bonus/project table. Fires on the first Monday
+    // of a new month so all majority-in-month weeks are settled.
+    tasks.push(notifyMonthlyRecap());
+  }
+
+  if (tasks.length === 0) {
     console.info(
-      `Today is weekday ${moment().day()} — nothing scheduled (run with IS_MONDAY, IS_TUESDAY or IS_FIRST_OF_MONTH=true to test).`
+      `Nothing scheduled today (run with IS_MONDAY, IS_TUESDAY, IS_FIRST_OF_MONTH or IS_MONTHLY_RECAP=true to test).`
     );
     return;
   }
