@@ -653,8 +653,10 @@ function buildSlackMessage(
   const partialDays = days.filter((d) => d.status === "partial").length;
   const missingHours = Math.max(0, totalExpected - totalActual);
 
-  // Intro and summary merge into one paragraph. Brief variant stops after
-  // the intro; issues variant appends "Til sammen mangler ...".
+  // Intro is brief by default; on shortfall we append the summary line.
+  // Caller decides via hasIssues (typically true when there's a gap, but
+  // suppressed when monthly recap fires the same day so we don't repeat
+  // shortfall info already in the recap).
   const baseIntro = `Her er en oversikt over timene dine for *${periodLabel}*.`;
   const introLine = hasIssues
     ? `${baseIntro} ${summarize(missingHours, emptyDays, partialDays)}`
@@ -788,19 +790,19 @@ const notifySlackers = async () => {
     const totalActual = days.reduce((s, d) => s + d.hoursActual, 0);
     const totalExpected = days.reduce((s, d) => s + d.hoursExpected, 0);
 
-    // Issues-variant only when there's an actual shortfall worth flagging.
-    // A 🟡 partial day on its own doesn't qualify if the week's total is
-    // already over target (someone may have logged 7 t Fri because they
-    // left early after working 8 t Mon–Wed — they're fine).
-    const hasEmpty = days.some((d) => d.status === "empty");
-    const missing = Math.max(0, totalExpected - totalActual);
-    const hasIssues = hasEmpty || missing > REPORT_TOLERANCE_HOURS;
-
     const targetUser = pickSlackRecipient(slackUsers, row.email);
     if (!targetUser) {
       console.error(`No Slack user found for ${row.email}`);
       continue;
     }
+
+    // Include shortfall paragraph when there's a gap — except on first-
+    // Monday runs, where the monthly recap fires the same day and would
+    // duplicate the shortfall info at a wider scope.
+    const hasEmpty = days.some((d) => d.status === "empty");
+    const missing = Math.max(0, totalExpected - totalActual);
+    const hasShortfall = hasEmpty || missing > REPORT_TOLERANCE_HOURS;
+    const hasIssues = hasShortfall && !isMonthlyRecap;
 
     const { text, blocks } = buildSlackMessage(
       startDate,
@@ -1468,12 +1470,34 @@ const main = async () => {
     tasks.push(notifyAdminAboutOvertime());
   }
   if (isTuesday) {
-    tasks.push(notifyLateRegisterers(lastWeekShortfallPeriod()));
+    // Skip Tuesday's weekly nag when today is also the 1st of the month.
+    // On those days the 1st-of-month cron sends a month-wide nag which
+    // covers the whole month (last week included), so the per-week nag
+    // is a strict subset and would just duplicate the message.
+    const todayIsFirstOfMonth = moment().date() === 1;
+    if (todayIsFirstOfMonth) {
+      console.info(
+        "Skipping Tuesday nag — today is also 1st of month, monthly nag covers it."
+      );
+    } else {
+      tasks.push(notifyLateRegisterers(lastWeekShortfallPeriod()));
+    }
   }
   if (isFirstOfMonth) {
-    // Nag stragglers about the *previous calendar month*. Reuses the
-    // Tuesday template, just with a different period.
-    tasks.push(notifyLateRegisterers(lastMonthShortfallPeriod()));
+    // Skip the nag if today is *also* the first Monday of the month — the
+    // Monday cron will send a monthly recap, which already includes a
+    // shortfall paragraph for anyone with missing hours. Without this
+    // check, those people would get the same "mangler X t for {måned}"
+    // info twice (~once a year, when 1st falls on a Monday).
+    const todayIsFirstMonday =
+      moment().day() === 1 && moment().date() <= 7;
+    if (todayIsFirstMonday) {
+      console.info(
+        "Skipping first-of-month nag — today is also first Monday, monthly recap covers it."
+      );
+    } else {
+      tasks.push(notifyLateRegisterers(lastMonthShortfallPeriod()));
+    }
   }
   if (isMonthlyRecap) {
     // Full digest with FG/bonus/project table. Fires on the first Monday
