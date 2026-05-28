@@ -22,15 +22,10 @@ const REPORT_TOLERANCE_HOURS = 0.5;
 
 moment.locale("nb");
 
-// Bonus tiers and FG thresholds — mirrors floq-timetracker-v2/src/constants/bonus.ts.
-const FG_THRESHOLD_90 = 90;
-const FG_THRESHOLD_95 = 95;
-const BONUS_FG90 = 500;
-const BONUS_FG90_TENURE = 750;
-const BONUS_FG95 = 750;
-const BONUS_FG95_TENURE = 1000;
-// Project codes that don't affect FG — mirrors nonFgCodes from frontend.
-const NON_FG_PROJECT_CODES = ["PER1005", "REK1010"];
+// Bonus is now computed entirely in the database via the
+// fg_bonus_employee_monthly RPC (blankoslo/floq-db). It handles per-week FG,
+// the majority-week-in-month rule, the non-FG-code adjustment, and the
+// Fagleder bonus tiers — so the bot no longer mirrors any of that logic.
 
 // Note: we used to hardcode an absence-code list here, but it was both
 // incomplete (missed several codes Floq counts as unavailable) and wrong
@@ -60,13 +55,21 @@ type ProjectRow = {
   // From floq: "billable" | "non_billable" | "unavailable" (verified via API)
   billable: string;
 };
-type FGRangeRow = { billable_hours: number; available_hours: number };
-type WeeklyFGRow = {
-  week_number: number;
+type FGPeriodRow = {
+  employee_id: number;
   available_hours: number;
   billable_hours: number;
+  fg_rate: number;
 };
-type TenureRoleRow = { employee_id: number };
+type MonthlyBonusRow = {
+  employee_id: number;
+  month_start: string;
+  month_end: string;
+  bonus_available_hours: number;
+  billable_hours: number;
+  fg_bonus_rate: number;
+  bonus: number; // kr, already computed
+};
 // entries_sums_for_employee_with_project view: project name + hours already
 // aggregated per (work_date, project). Use this instead of /time_entry,
 // which is event-based (multiple rows per change → naive sums overcount).
@@ -143,41 +146,27 @@ async function apiPost<T>(path: string, body: unknown): Promise<T> {
   return res.json() as Promise<T>;
 }
 
-// === Date helpers ===
-const isFirstOfMonth =
-  process.env.IS_FIRST_OF_MONTH === "true" || moment().date() === 1;
-const isMonday = process.env.IS_MONDAY === "true" || moment().day() === 1;
-const isTuesday = process.env.IS_TUESDAY === "true" || moment().day() === 2;
-// Monthly recap fires on the first Monday of a new month — by then every
-// "majority-of-days-in-previous-month" week has finished, so bonus + FG
-// calculations are stable. Auto-detect: today is a Monday and the date
-// is in 1–7 (i.e. it's the first Monday of the month).
+// === Schedule flags ===
+// IMPORTANT: these are env-var-only, NOT auto-detected from the current
+// weekday. Auto-detection caused a bug where any job running on a Monday
+// (e.g. the monthly recap job) also fired the weekly flow — double messages.
+// Each Cloud Scheduler trigger now sets exactly the flag it intends.
+const isMonday = process.env.IS_MONDAY === "true";
+const isTuesday = process.env.IS_TUESDAY === "true";
+const isFirstOfMonth = process.env.IS_FIRST_OF_MONTH === "true";
+// Overtime check posts to the #overtid channel — own flag so it doesn't
+// fire on every Monday-digest test run.
+const isOvertimeCheck = process.env.IS_OVERTIME === "true";
+// The monthly recap rides along with the Monday run, but only on the first
+// Monday of the month (date 1–7) — by then every "majority-of-days-in-
+// previous-month" week has finished, so bonus + FG are stable. No separate
+// cron needed. IS_MONTHLY_RECAP=true forces it for local testing.
 const isMonthlyRecap =
   process.env.IS_MONTHLY_RECAP === "true" ||
-  (moment().day() === 1 && moment().date() <= 7);
+  (isMonday && moment().date() <= 7);
 
-// Monday flow: covers all of last week (Mon–Sun). The IS_FIRST_OF_MONTH
-// legacy branch covers a partial current week when the job runs on a non-
-// Monday 1st-of-month — only relevant if the schedule ever moves off
-// Monday. Tuesday/Monthly flows have their own date helpers below.
-const getStartAndEndDate = () => {
-  let startDate: moment.Moment;
-  let endDate: moment.Moment;
-
-  if (isFirstOfMonth && !isMonday) {
-    startDate = moment().startOf("isoWeek");
-    endDate = moment().subtract(1, "day");
-  } else {
-    startDate = moment().subtract(1, "week").startOf("isoWeek");
-    endDate = moment().subtract(1, "week").endOf("isoWeek");
-  }
-  return { startDate, endDate };
-};
-
-// Tuesday flow always wants previous calendar week (Mon–Sun before today),
-// regardless of date-of-month. Sharing getStartAndEndDate() with Monday led
-// to a bug where IS_FIRST_OF_MONTH=true mangled the period to "this Mon
-// only".
+// Previous calendar week (Mon–Sun before today). Used by both the Monday
+// digest and the Tuesday follow-up — both report on the just-finished week.
 const getLastFullWeekRange = () => ({
   startDate: moment().subtract(1, "week").startOf("isoWeek"),
   endDate: moment().subtract(1, "week").endOf("isoWeek"),
@@ -196,130 +185,52 @@ async function fetchTimeTrackingStatus(
 }
 
 async function fetchEmployeeIdByEmail(email: string): Promise<number | null> {
-  try {
-    const rows = await apiGet<EmployeeRow[]>(
-      `/employees?select=id&email=eq.${encodeURIComponent(email)}`
-    );
-    return rows[0]?.id ?? null;
-  } catch (err) {
-    console.error(`Failed to look up employee id for ${email}:`, err);
-    return null;
-  }
+  // Throws on a real API error (caller's loop skips the employee). Returns
+  // null only when the employee genuinely isn't found.
+  const rows = await apiGet<EmployeeRow[]>(
+    `/employees?select=id&email=eq.${encodeURIComponent(email)}`
+  );
+  return rows[0]?.id ?? null;
 }
+
+// Bulk fetchers below intentionally do NOT catch — a failed shared fetch
+// must abort the whole run (the error propagates to main's allSettled and
+// no messages go out) rather than silently degrade every message.
 
 async function fetchProjectInfoMap(): Promise<Map<string, ProjectRow>> {
   // The view returns project IDs (e.g. "AID1000"); fetch human-readable
   // names and the billable category so we can split work vs absence in
   // the project breakdown.
-  try {
-    const projects = await apiGet<ProjectRow[]>(
-      "/projects?select=id,name,billable"
-    );
-    return new Map(projects.map((p) => [p.id, p]));
-  } catch (err) {
-    console.error("Failed to fetch projects:", err);
-    return new Map();
-  }
+  const projects = await apiGet<ProjectRow[]>(
+    "/projects?select=id,name,billable"
+  );
+  return new Map(projects.map((p) => [p.id, p]));
 }
 
 async function fetchHolidays(
   startDate: string,
   endDate: string
 ): Promise<HolidayRow[]> {
-  try {
-    return await apiGet<HolidayRow[]>(
-      `/holidays?date=gte.${startDate}&date=lte.${endDate}`
-    );
-  } catch (err) {
-    console.error("Failed to fetch holidays:", err);
-    return [];
-  }
+  return apiGet<HolidayRow[]>(
+    `/holidays?date=gte.${startDate}&date=lte.${endDate}`
+  );
 }
 
 async function fetchAllAbsencesForWeek(
   startDate: string,
   endDate: string
 ): Promise<AbsenceRow[]> {
-  try {
-    return await apiGet<AbsenceRow[]>(
-      `/absence?date=gte.${startDate}&date=lte.${endDate}`
-    );
-  } catch (err) {
-    console.error("Failed to fetch absences:", err);
-    return [];
-  }
+  return apiGet<AbsenceRow[]>(
+    `/absence?date=gte.${startDate}&date=lte.${endDate}`
+  );
 }
 
 async function fetchAllEmployees(): Promise<EmployeeRow[]> {
-  try {
-    return await apiGet<EmployeeRow[]>("/employees?select=id,email");
-  } catch (err) {
-    console.error("Failed to fetch employees:", err);
-    return [];
-  }
+  return apiGet<EmployeeRow[]>("/employees?select=id,email");
 }
 
-async function fetchTenureRoleEmployeeIds(
-  start: string,
-  end: string
-): Promise<Set<number>> {
-  // Single bulk call to find which employees hold the Fagleder tenure role
-  // for any part of the given period. Mirrors getHasTenureRole but for all
-  // employees in one query.
-  try {
-    const rows = await apiGet<TenureRoleRow[]>(
-      `/employee_tenure_role?select=employee_id&tenure_role=eq.Fagleder&from_date=lte.${end}&or=(to_date.is.null,to_date.gte.${start})`
-    );
-    return new Set(rows.map((r) => r.employee_id));
-  } catch (err) {
-    console.error("Failed to fetch tenure roles:", err);
-    return new Set();
-  }
-}
-
-async function fetchEmployeeWeeklyFG(
-  employeeId: number,
-  year: number
-): Promise<Map<number, { billable: number; available: number }>> {
-  try {
-    const rows = await apiGet<WeeklyFGRow[]>(
-      `/rpc/employee_weekly_fg?year=${year}&emp_id=${employeeId}`
-    );
-    return new Map(
-      rows.map((r) => [
-        r.week_number,
-        { billable: r.billable_hours, available: r.available_hours },
-      ])
-    );
-  } catch (err) {
-    console.error(`Failed to fetch weekly FG for ${employeeId}:`, err);
-    return new Map();
-  }
-}
-
-async function fetchExcludedFGHoursByWeek(
-  employeeId: number,
-  year: number
-): Promise<Map<number, number>> {
-  // Hours on non-FG codes (PER1005, REK1010), keyed by ISO week. These are
-  // subtracted from `available_hours` before bonus is computed.
-  const codes = NON_FG_PROJECT_CODES.join(",");
-  try {
-    const data = await apiGet<{ minutes: number; date: string }[]>(
-      `/time_entry?select=minutes,date&employee=eq.${employeeId}&project=in.(${codes})&date=gte.${year}-01-01&date=lte.${year}-12-31`
-    );
-    const map = new Map<number, number>();
-    for (const { minutes, date } of data) {
-      const week = moment(`${date}T12:00:00`).isoWeek();
-      map.set(week, (map.get(week) ?? 0) + minutes / 60);
-    }
-    return map;
-  } catch (err) {
-    console.error(`Failed to fetch excluded FG hours for ${employeeId}:`, err);
-    return new Map();
-  }
-}
-
+// Per-employee fetcher: throws on a real API error. Callers wrap the loop
+// body so one employee's failure skips just them (loud), not the whole run.
 async function fetchProjectHoursPerDay(
   employeeId: number,
   startDate: string,
@@ -327,85 +238,39 @@ async function fetchProjectHoursPerDay(
 ): Promise<ProjectHoursPerDayRow[]> {
   // Note: RPC parameters are `from_date`/`to_date`, NOT start_date/end_date
   // (verified via PostgREST hint when called with wrong names).
-  try {
-    return await apiGet<ProjectHoursPerDayRow[]>(
-      `/rpc/entries_sums_for_employee_with_project?employee_id=${employeeId}&from_date=${startDate}&to_date=${endDate}`
-    );
-  } catch (err) {
-    console.error(
-      `Failed to fetch project hours for ${employeeId}:`,
-      err
-    );
-    return [];
-  }
+  return apiGet<ProjectHoursPerDayRow[]>(
+    `/rpc/entries_sums_for_employee_with_project?employee_id=${employeeId}&from_date=${startDate}&to_date=${endDate}`
+  );
 }
 
-async function fetchFGForRange(
-  employeeId: number,
+async function fetchAllFGForRange(
   start: string,
   end: string
-): Promise<{ billable: number; available: number }> {
-  try {
-    const rows = await apiGet<FGRangeRow[]>(
-      `/rpc/fg_for_employee?emp_id=${employeeId}&start_date=${start}&end_date=${end}`
-    );
-    const billable = rows.reduce((s, r) => s + r.billable_hours, 0);
-    const available = rows.reduce((s, r) => s + r.available_hours, 0);
-    return { billable, available };
-  } catch (err) {
-    console.error(`Failed to fetch FG for ${employeeId}:`, err);
-    return { billable: 0, available: 0 };
-  }
+): Promise<Map<number, { billable: number; available: number }>> {
+  // emp_id optional — omit it to get every employee's FG for the period in
+  // one call. (fg_employee_period from blankoslo/floq-db PR 91.)
+  const rows = await apiGet<FGPeriodRow[]>(
+    `/rpc/fg_employee_period?from_date=${start}&to_date=${end}`
+  );
+  return new Map(
+    rows.map((r) => [
+      r.employee_id,
+      { billable: r.billable_hours, available: r.available_hours },
+    ])
+  );
 }
 
-// === Bonus / FG calculations (ported from floq-timetracker-v2/lib/statsCalculations.ts) ===
-
-function fgBonusAmount(pct: number, hasTenureRole: boolean): number {
-  if (pct >= FG_THRESHOLD_95)
-    return hasTenureRole ? BONUS_FG95_TENURE : BONUS_FG95;
-  if (pct >= FG_THRESHOLD_90)
-    return hasTenureRole ? BONUS_FG90_TENURE : BONUS_FG90;
-  return 0;
-}
-
-function calcMonthlyBonus(
-  weeklyFG: Map<number, { billable: number; available: number }>,
-  excludedByWeek: Map<number, number>,
-  monthStart: moment.Moment,
-  hasTenureRole: boolean
-): number {
-  // A week "belongs" to this month if it has at least 4 of its 7 days
-  // (majority) in the month. That way border weeks aren't double-counted
-  // between adjacent months — each week contributes to exactly one
-  // month's bonus. The scheduler is expected to wait until the first
-  // Monday of the new month, so all majority-of-prev-month weeks are
-  // settled.
-  const daysPerWeek = new Map<number, number>();
-  const cursor = monthStart.clone();
-  const month = monthStart.month();
-  while (cursor.month() === month) {
-    const week = cursor.isoWeek();
-    daysPerWeek.set(week, (daysPerWeek.get(week) ?? 0) + 1);
-    cursor.add(1, "day");
-  }
-  const weeksInMonth = new Set<number>();
-  for (const [week, days] of Array.from(daysPerWeek)) {
-    if (days >= 4) weeksInMonth.add(week);
-  }
-
-  let total = 0;
-  for (const week of Array.from(weeksInMonth)) {
-    const data = weeklyFG.get(week);
-    if (!data) continue;
-    const adjustedAvailable = Math.max(
-      0,
-      data.available - (excludedByWeek.get(week) ?? 0)
-    );
-    if (adjustedAvailable <= 0) continue;
-    const pct = (data.billable / adjustedAvailable) * 100;
-    total += fgBonusAmount(pct, hasTenureRole);
-  }
-  return total;
+async function fetchAllMonthlyBonuses(
+  year: number,
+  month: number // 1–12
+): Promise<Map<number, number>> {
+  // emp_id is optional — omitting it returns every employee's bonus in one
+  // call. The DB does everything: per-week FG with bonus_hours_for_employee,
+  // majority-week-in-month assignment, and the Fagleder bonus tiers.
+  const rows = await apiGet<MonthlyBonusRow[]>(
+    `/rpc/fg_bonus_employee_monthly?year=${year}&month=${month}`
+  );
+  return new Map(rows.map((r) => [r.employee_id, r.bonus]));
 }
 
 // === Per-day breakdown ===
@@ -832,7 +697,7 @@ function buildSlackMessage(
 // === Main flows ===
 
 const notifySlackers = async () => {
-  const { startDate, endDate } = getStartAndEndDate();
+  const { startDate, endDate } = getLastFullWeekRange();
   const startStr = startDate.format("YYYY-MM-DD");
   const endStr = endDate.format("YYYY-MM-DD");
 
@@ -892,16 +757,22 @@ const notifySlackers = async () => {
   }
 
   for (const row of targets) {
-    const employeeId = await fetchEmployeeIdByEmail(row.email);
-    if (!employeeId) {
-      console.warn(`No employee_id for ${row.email}, skipping`);
+    // Per-employee fetches are wrapped so one person's API failure skips
+    // just them (loud) rather than sending a wrong message or aborting the
+    // whole run.
+    let employeeId: number | null;
+    let projectRows: ProjectHoursPerDayRow[];
+    try {
+      employeeId = await fetchEmployeeIdByEmail(row.email);
+      if (!employeeId) {
+        console.warn(`No employee_id for ${row.email}, skipping`);
+        continue;
+      }
+      projectRows = await fetchProjectHoursPerDay(employeeId, startStr, endStr);
+    } catch (err) {
+      console.error(`Skipping ${row.email} — fetch failed:`, err);
       continue;
     }
-    const projectRows = await fetchProjectHoursPerDay(
-      employeeId,
-      startStr,
-      endStr
-    );
     const days = buildPerDayBreakdown(
       startDate,
       endDate,
@@ -1432,6 +1303,7 @@ const notifyMonthlyRecap = async () => {
   const endStr = monthEnd.format("YYYY-MM-DD");
   const monthLabel = monthStart.format("MMMM YYYY");
   const year = monthStart.year();
+  const month = monthStart.month() + 1; // moment month is 0-indexed; SQL wants 1–12
 
   console.info(`Monthly recap for ${monthLabel} (${startStr} → ${endStr})`);
 
@@ -1469,13 +1341,15 @@ const notifyMonthlyRecap = async () => {
     allEmployees,
     allAbsences,
     projectInfo,
-    tenureRoleIds,
+    bonusByEmployee,
+    fgByEmployee,
     slackUsersResp,
   ] = await Promise.all([
     fetchAllEmployees(),
     fetchAllAbsencesForWeek(startStr, endStr),
     fetchProjectInfoMap(),
-    fetchTenureRoleEmployeeIds(startStr, endStr),
+    fetchAllMonthlyBonuses(year, month),
+    fetchAllFGForRange(startStr, endStr),
     slack.users.list(),
   ]);
 
@@ -1505,21 +1379,20 @@ const notifyMonthlyRecap = async () => {
       console.warn(`No employee_id for ${row.email}, skipping`);
       continue;
     }
-    const hasTenureRole = tenureRoleIds.has(employeeId);
+    // Per-employee fetch wrapped: a single failure skips just this person.
+    let projectRows: ProjectHoursPerDayRow[];
+    try {
+      projectRows = await fetchProjectHoursPerDay(employeeId, startStr, endStr);
+    } catch (err) {
+      console.error(`Skipping ${row.email} — fetch failed:`, err);
+      continue;
+    }
+    const fgRange = fgByEmployee.get(employeeId) ?? {
+      billable: 0,
+      available: 0,
+    };
+    const bonusKr = bonusByEmployee.get(employeeId) ?? 0;
 
-    const [weeklyFG, excludedByWeek, fgRange, projectRows] = await Promise.all([
-      fetchEmployeeWeeklyFG(employeeId, year),
-      fetchExcludedFGHoursByWeek(employeeId, year),
-      fetchFGForRange(employeeId, startStr, endStr),
-      fetchProjectHoursPerDay(employeeId, startStr, endStr),
-    ]);
-
-    const bonusKr = calcMonthlyBonus(
-      weeklyFG,
-      excludedByWeek,
-      monthStart,
-      hasTenureRole
-    );
     const fgPct =
       fgRange.available > 0 ? (fgRange.billable / fgRange.available) * 100 : null;
 
@@ -1590,6 +1463,8 @@ const main = async () => {
   const tasks: Promise<unknown>[] = [];
   if (isMonday) {
     tasks.push(notifySlackers());
+  }
+  if (isOvertimeCheck) {
     tasks.push(notifyAdminAboutOvertime());
   }
   if (isTuesday) {
@@ -1608,7 +1483,7 @@ const main = async () => {
 
   if (tasks.length === 0) {
     console.info(
-      `Nothing scheduled today (run with IS_MONDAY, IS_TUESDAY, IS_FIRST_OF_MONTH or IS_MONTHLY_RECAP=true to test).`
+      `Nothing scheduled today (run with IS_MONDAY, IS_TUESDAY, IS_OVERTIME, IS_FIRST_OF_MONTH or IS_MONTHLY_RECAP=true to test).`
     );
     return;
   }
