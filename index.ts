@@ -20,6 +20,14 @@ const TEST_USER_SLACK_EMAIL = process.env.TEST_USER_SLACK_EMAIL?.toLowerCase().t
 // Ignore small deltas so a 7 t vs 7,5 t day doesn't trigger a notification.
 const REPORT_TOLERANCE_HOURS = 0.5;
 
+// === Ledig kapasitet (staffing/availability) ===
+// Channel that receives the "free capacity next N weeks" overview. Posted by
+// name (chat.postMessage accepts "#name") — the bot just needs to be a member.
+const CAPACITY_CHANNEL =
+  process.env.CAPACITY_CHANNEL || "admin-bemanningogsalg-diskusjon";
+// How many ISO weeks ahead (including the current week) the overview covers.
+const CAPACITY_WEEKS_AHEAD = Number(process.env.CAPACITY_WEEKS_AHEAD || "6");
+
 moment.locale("nb");
 
 // Bonus is now computed entirely in the database via the
@@ -48,7 +56,14 @@ type TimeTrackingStatusRow = {
 
 type EmployeeRow = { id: number; email: string };
 type HolidayRow = { date: string; name: string };
-type AbsenceRow = { date: string; employee_id: number; reason: string };
+type AbsenceRow = {
+  date: string;
+  employee_id: number;
+  reason: string;
+  // Defaults to 100 in the DB. Present on /absence rows; older callers that
+  // only read date/employee_id are unaffected.
+  percentage?: number;
+};
 type ProjectRow = {
   id: string;
   name: string;
@@ -157,6 +172,15 @@ const isFirstOfMonth = process.env.IS_FIRST_OF_MONTH === "true";
 // Overtime check posts to the #overtid channel — own flag so it doesn't
 // fire on every Monday-digest test run.
 const isOvertimeCheck = process.env.IS_OVERTIME === "true";
+// Availability overview posts to the bemanning/salg channel — its own flag so
+// it doesn't ride along with the Monday digest unless explicitly scheduled.
+const isAvailabilityCheck = process.env.IS_AVAILABILITY === "true";
+// Aggregated admin "missing time" overview — its own flag so it can be
+// scheduled and tested independently of the personal Monday/Tuesday/month
+// nudges. ADMIN_MISSING_PERIOD picks which period it reports on.
+const isAdminMissing = process.env.IS_ADMIN_MISSING === "true";
+const adminMissingPeriod =
+  process.env.ADMIN_MISSING_PERIOD === "month" ? "month" : "week";
 // The monthly recap rides along with the Monday run, but only on the first
 // Monday of the month (date 1–7) — by then every "majority-of-days-in-
 // previous-month" week has finished, so bonus + FG are stable. No separate
@@ -881,6 +905,288 @@ const notifyAdminAboutOvertime = async () => {
   }
 };
 
+// === Ledig kapasitet: hvem har ubemannede dager de neste N ukene ===
+//
+// "Ledig" mirrors Floq's own availability model (floq-db `available_dates`):
+// a working day is free when it's a weekday, not a holiday, and the employee
+// isn't fully booked that day. Bookings come from two sources — planned
+// staffing (the `staffing` table) and the absence calendar (`absence`, e.g.
+// Ferie/Permisjon). We sum both percentages per (employee, day); any day with
+// < 100 % booked has free capacity. Anyone with one or more such days in the
+// window shows up in the overview.
+//
+// Everything is fetched in bulk (4 calls total: employees, staffing, absence,
+// holidays) and the per-employee loop runs in memory — no per-employee API
+// round-trips.
+
+type EmployeeInDatesRow = {
+  employee_id: number;
+  first_name: string;
+  last_name: string;
+  role: string;
+  image_url: string | null;
+};
+
+type StaffingRow = {
+  employee: number;
+  date: string; // YYYY-MM-DD
+  percentage: number;
+};
+
+type WeekFreeDays = {
+  isoWeek: number;
+  freeDays: number;
+};
+
+type EmployeeAvailability = {
+  name: string;
+  role: string;
+  totalFreeDays: number;
+  // Only weeks that actually have free days, in chronological order.
+  perWeek: WeekFreeDays[];
+};
+
+// Desired role ordering in the overview. Anything unknown sorts last.
+const ROLE_ORDER = ["Designer", "Teknolog", "Annet"];
+function roleRank(role: string): number {
+  const i = ROLE_ORDER.indexOf(role);
+  return i === -1 ? ROLE_ORDER.length : i;
+}
+
+async function fetchEmployeesInDates(
+  startDate: string,
+  endDate: string
+): Promise<EmployeeInDatesRow[]> {
+  // RPC returns active employees in the window (handles employment/termination
+  // dates) plus role — used for the overview labels.
+  return apiGet<EmployeeInDatesRow[]>(
+    `/rpc/get_employees_in_dates?start_date=${startDate}&end_date=${endDate}`
+  );
+}
+
+async function fetchStaffingForRange(
+  startDate: string,
+  endDate: string
+): Promise<StaffingRow[]> {
+  return apiGet<StaffingRow[]>(
+    `/staffing?date=gte.${startDate}&date=lte.${endDate}&select=employee,date,percentage`
+  );
+}
+
+// "employeeId|date" → summed booked percentage. Multiple staffing rows (several
+// projects on the same day) and absence all add up.
+function bookingKey(employeeId: number, date: string): string {
+  return `${employeeId}|${date}`;
+}
+
+function computeAvailability(
+  employees: EmployeeInDatesRow[],
+  staffing: StaffingRow[],
+  absences: AbsenceRow[],
+  workdays: Array<{ date: string; isoWeek: number }>
+): EmployeeAvailability[] {
+  const bookedByEmpDate = new Map<string, number>();
+  const addBooking = (empId: number, date: string, pct: number) => {
+    const k = bookingKey(empId, date);
+    bookedByEmpDate.set(k, (bookedByEmpDate.get(k) ?? 0) + pct);
+  };
+  for (const s of staffing) addBooking(s.employee, s.date, s.percentage ?? 0);
+  // absence.percentage defaults to 100 in the DB; treat a missing value as a
+  // full day off rather than 0.
+  for (const a of absences) addBooking(a.employee_id, a.date, a.percentage ?? 100);
+
+  const result: EmployeeAvailability[] = [];
+  for (const e of employees) {
+    const perWeekMap = new Map<number, number>();
+    let total = 0;
+    for (const wd of workdays) {
+      const booked = bookedByEmpDate.get(bookingKey(e.employee_id, wd.date)) ?? 0;
+      // Strictly less than 100 % booked → there's capacity to sell that day.
+      if (booked < 100 - 1e-9) {
+        total += 1;
+        perWeekMap.set(wd.isoWeek, (perWeekMap.get(wd.isoWeek) ?? 0) + 1);
+      }
+    }
+    if (total === 0) continue;
+    const perWeek = Array.from(perWeekMap.entries())
+      .sort((a, b) => a[0] - b[0])
+      .map(([isoWeek, freeDays]) => ({ isoWeek, freeDays }));
+    result.push({
+      name: `${e.first_name} ${e.last_name}`,
+      role: e.role,
+      totalFreeDays: total,
+      perWeek,
+    });
+  }
+  // Group by role (Designer → Teknolog → Annet); within a role, most
+  // available first, then by name.
+  result.sort(
+    (a, b) =>
+      roleRank(a.role) - roleRank(b.role) ||
+      b.totalFreeDays - a.totalFreeDays ||
+      a.name.localeCompare(b.name, "nb")
+  );
+  return result;
+}
+
+function buildAvailabilityMessage(
+  weekStart: moment.Moment,
+  windowEnd: moment.Moment,
+  isoWeeks: number[],
+  totalWorkdays: number,
+  people: EmployeeAvailability[]
+): { text: string; blocks: Array<Record<string, unknown>> } {
+  // Nobody free → a single celebratory line, no headline or table.
+  if (people.length === 0) {
+    const line = `Det er ingen med ledig tid neste ${isoWeeks.length} uker 🎉`;
+    return {
+      text: line,
+      blocks: [{ type: "section", text: { type: "mrkdwn", text: line } }],
+    };
+  }
+
+  const firstWeek = isoWeeks[0];
+  const lastWeek = isoWeeks[isoWeeks.length - 1];
+  const periodLabel =
+    `uke ${firstWeek}–${lastWeek}, ${weekStart.format("D. MMMM")}–${windowEnd.format("D. MMMM")}`;
+
+  const introLine = `*Ledig kapasitet de neste ${isoWeeks.length} ukene (${periodLabel}):*`;
+  const summaryLine = `*${people.length}* ${people.length === 1 ? "person" : "personer"} har minst én ubemannet dag (vinduet har ${totalWorkdays} arbeidsdager).`;
+
+  // Compact per-week tokens, e.g. "u27: 5, u29: 3" — only weeks with free days.
+  const weekTokens = (p: EmployeeAvailability) =>
+    p.perWeek.map((w) => `u${w.isoWeek}: ${w.freeDays}`).join(", ");
+
+  // Plain-text fallback (no markdown asterisks)
+  const textLines = [
+    introLine.replace(/\*/g, ""),
+    "",
+    summaryLine.replace(/\*/g, ""),
+  ];
+  if (people.length > 0) {
+    textLines.push("");
+    for (const p of people) {
+      textLines.push(
+        `${p.name} (${p.role}): ${p.totalFreeDays} dag${p.totalFreeDays === 1 ? "" : "er"} — ${weekTokens(p)}`
+      );
+    }
+  }
+  const text = textLines.join("\n");
+
+  const blocks: Array<Record<string, unknown>> = [
+    { type: "section", text: { type: "mrkdwn", text: introLine } },
+    { type: "section", text: { type: "mrkdwn", text: summaryLine } },
+  ];
+
+  if (people.length > 0) {
+    const headerRow = [
+      headerCell("Navn"),
+      headerCell("Rolle"),
+      headerCell("Ledige dager"),
+      headerCell("Fordelt på uker"),
+    ];
+    const dataRows = people.map((p) => [
+      textCell(p.name),
+      textCell(p.role),
+      textCell(`${p.totalFreeDays}`),
+      textCell(weekTokens(p)),
+    ]);
+    blocks.push({
+      type: "table",
+      column_settings: [
+        { align: "left" }, // Navn
+        { align: "left" }, // Rolle
+        { align: "right" }, // Ledige dager
+        { align: "left", is_wrapped: true }, // Fordelt på uker
+      ],
+      rows: [headerRow, ...dataRows],
+    });
+  }
+
+  return { text, blocks };
+}
+
+const notifyAvailableConsultants = async () => {
+  const today = moment().startOf("day");
+  // Window: Monday of the current ISO week through the end of the N-th week.
+  const weekStart = today.clone().startOf("isoWeek");
+  const windowEnd = weekStart
+    .clone()
+    .add(CAPACITY_WEEKS_AHEAD, "weeks")
+    .subtract(1, "day");
+  const startStr = weekStart.format("YYYY-MM-DD");
+  const endStr = windowEnd.format("YYYY-MM-DD");
+
+  console.info(
+    `Availability overview ${startStr} → ${endStr} (${CAPACITY_WEEKS_AHEAD} weeks)`
+  );
+
+  let employees: EmployeeInDatesRow[];
+  let staffing: StaffingRow[];
+  let absences: AbsenceRow[];
+  let holidays: HolidayRow[];
+  try {
+    [employees, staffing, absences, holidays] = await Promise.all([
+      fetchEmployeesInDates(startStr, endStr),
+      fetchStaffingForRange(startStr, endStr),
+      fetchAllAbsencesForWeek(startStr, endStr),
+      fetchHolidays(startStr, endStr),
+    ]);
+  } catch (err) {
+    console.error("availability fetch failed:", err);
+    return;
+  }
+
+  // Enumerate workdays from *today* (skip already-passed days of the current
+  // week — you can't sell yesterday) through the window end: weekdays only,
+  // excluding holidays.
+  const holidaySet = new Set(holidays.map((h) => h.date));
+  const workdays: Array<{ date: string; isoWeek: number }> = [];
+  const isoWeeksSet = new Set<number>();
+  const cur = today.clone();
+  while (cur.isSameOrBefore(windowEnd, "day")) {
+    const ds = cur.format("YYYY-MM-DD");
+    if (cur.isoWeekday() <= 5 && !holidaySet.has(ds)) {
+      const w = cur.isoWeek();
+      workdays.push({ date: ds, isoWeek: w });
+      isoWeeksSet.add(w);
+    }
+    cur.add(1, "day");
+  }
+  const isoWeeks = Array.from(isoWeeksSet).sort((a, b) => a - b);
+
+  const people = computeAvailability(employees, staffing, absences, workdays);
+
+  const { text, blocks } = buildAvailabilityMessage(
+    weekStart,
+    windowEnd,
+    isoWeeks,
+    workdays.length,
+    people
+  );
+
+  console.info(
+    `Availability: ${people.length}/${employees.length} employees with ≥1 free day over ${workdays.length} workdays`
+  );
+
+  if (DRY_RUN) {
+    console.info("DRY_RUN — availability preview:\n" + text);
+    return;
+  }
+
+  try {
+    await slack.chat.postMessage({
+      channel: `#${CAPACITY_CHANNEL}`,
+      text,
+      blocks: blocks as any,
+      as_user: true,
+    });
+    console.info(`Sent availability overview to #${CAPACITY_CHANNEL}`);
+  } catch (err) {
+    console.error(`Failed to post to #${CAPACITY_CHANNEL}:`, err);
+  }
+};
+
 // === Tuesday: follow-up nudge to stragglers ===
 
 function buildLateRegisterMessage(
@@ -1090,6 +1396,172 @@ const notifyLateRegisterers = async (period: ShortfallPeriod) => {
     } catch (err) {
       console.error(`Failed to send to @${targetUser.name}:`, err);
     }
+  }
+};
+
+// === Admin: aggregert oversikt over manglende timeføring ===
+//
+// A single table posted to the bemanning/salg channel listing who still has a
+// *real* shortfall for the period — i.e. after subtracting marked-absence days
+// (same tolerance as the individual Tuesday/month nudges), so people on ferie
+// don't clutter the list. Rides along with the Monday/Tuesday/first-of-month
+// triggers as an admin's-eye companion to the personal DMs.
+
+type MissingTimeRow = {
+  name: string;
+  lastDate: string | null;
+  missingHours: number;
+};
+
+function buildAdminMissingMessage(
+  periodLabel: string,
+  rows: MissingTimeRow[]
+): { text: string; blocks: Array<Record<string, unknown>> } {
+  if (rows.length === 0) {
+    const line = `Alle har ført timene sine for *${periodLabel}* 🎉`;
+    return {
+      text: line.replace(/\*/g, ""),
+      blocks: [{ type: "section", text: { type: "mrkdwn", text: line } }],
+    };
+  }
+
+  const fmtDate = (d: string | null) =>
+    d ? moment(d).format("D. MMM YYYY") : "aldri";
+
+  const totalMissing = rows.reduce((s, r) => s + r.missingHours, 0);
+  const introLine = `*Manglende timeføring for ${periodLabel}*`;
+  const summaryLine = `*${rows.length}* ${rows.length === 1 ? "person mangler" : "personer mangler"} timeføring (totalt ${formatHoursShort(totalMissing)} t).`;
+
+  const textLines = [
+    introLine.replace(/\*/g, ""),
+    "",
+    summaryLine.replace(/\*/g, ""),
+    "",
+    ...rows.map(
+      (r) =>
+        `${r.name} — sist ført ${fmtDate(r.lastDate)} — mangler ${formatHours(r.missingHours)} t`
+    ),
+  ];
+  const text = textLines.join("\n");
+
+  const headerRow = [
+    headerCell("Ansatt"),
+    headerCell("Sist ført dato"),
+    headerCell("Manglende timeføring"),
+  ];
+  const dataRows = rows.map((r) => [
+    textCell(r.name),
+    textCell(fmtDate(r.lastDate)),
+    textCell(`${formatHours(r.missingHours)} t`),
+  ]);
+
+  const blocks: Array<Record<string, unknown>> = [
+    { type: "section", text: { type: "mrkdwn", text: introLine } },
+    { type: "section", text: { type: "mrkdwn", text: summaryLine } },
+    {
+      type: "table",
+      column_settings: [
+        { align: "left" }, // Ansatt
+        { align: "left" }, // Sist ført dato
+        { align: "right" }, // Manglende timeføring
+      ],
+      rows: [headerRow, ...dataRows],
+    },
+  ];
+
+  return { text, blocks };
+}
+
+const notifyAdminMissingTime = async (period: ShortfallPeriod) => {
+  const { startDate, endDate, label: periodLabel, logTag } = period;
+  const startStr = startDate.format("YYYY-MM-DD");
+  const endStr = endDate.format("YYYY-MM-DD");
+
+  console.info(
+    `Admin missing-time overview (${logTag}) for ${startStr} → ${endStr}`
+  );
+
+  let rows: TimeTrackingStatusRow[];
+  try {
+    rows = await fetchTimeTrackingStatus(startDate, endDate);
+  } catch (err) {
+    console.error("time_tracking_status failed:", err);
+    return;
+  }
+  if (!Array.isArray(rows)) {
+    console.error("time_tracking_status did not return an array:", rows);
+    return;
+  }
+
+  // Only those who owed time this period (registered < available).
+  const candidates = rows.filter((r) => {
+    if (r.available_hours <= 0) return false;
+    const registered = r.billable_hours + r.non_billable_hours;
+    return registered < r.available_hours - REPORT_TOLERANCE_HOURS;
+  });
+
+  // Absence-calendar tolerance: marked weekday absence explains part of a gap.
+  const [allAbsences, allEmployees] = await Promise.all([
+    fetchAllAbsencesForWeek(startStr, endStr),
+    fetchAllEmployees(),
+  ]);
+  const idByEmail = new Map(
+    allEmployees.map((e) => [e.email.toLowerCase(), e.id])
+  );
+  const absenceWeekdaysByEmployee = new Map<number, number>();
+  for (const a of allAbsences) {
+    const day = moment(a.date).day();
+    if (day < 1 || day > 5) continue; // weekdays only
+    absenceWeekdaysByEmployee.set(
+      a.employee_id,
+      (absenceWeekdaysByEmployee.get(a.employee_id) ?? 0) + 1
+    );
+  }
+
+  const missingRows: MissingTimeRow[] = [];
+  for (const row of candidates) {
+    const apiMissing =
+      row.available_hours - row.billable_hours - row.non_billable_hours;
+    const employeeId = idByEmail.get(row.email.toLowerCase());
+    const absenceDays = employeeId
+      ? absenceWeekdaysByEmployee.get(employeeId) ?? 0
+      : 0;
+    const realMissing = apiMissing - absenceDays * STANDARD_WORKDAY_HOURS;
+    if (realMissing <= REPORT_TOLERANCE_HOURS) continue; // explained by absence
+    missingRows.push({
+      name: row.name,
+      lastDate: row.last_date,
+      missingHours: realMissing,
+    });
+  }
+
+  // Biggest gaps first; ties by name.
+  missingRows.sort(
+    (a, b) =>
+      b.missingHours - a.missingHours || a.name.localeCompare(b.name, "nb")
+  );
+
+  const { text, blocks } = buildAdminMissingMessage(periodLabel, missingRows);
+
+  console.info(
+    `Admin missing-time: ${missingRows.length} with a real shortfall for ${periodLabel}`
+  );
+
+  if (DRY_RUN) {
+    console.info("DRY_RUN — admin missing-time preview:\n" + text);
+    return;
+  }
+
+  try {
+    await slack.chat.postMessage({
+      channel: `#${CAPACITY_CHANNEL}`,
+      text,
+      blocks: blocks as any,
+      as_user: true,
+    });
+    console.info(`Sent admin missing-time overview to #${CAPACITY_CHANNEL}`);
+  } catch (err) {
+    console.error(`Failed to post to #${CAPACITY_CHANNEL}:`, err);
   }
 };
 
@@ -1469,6 +1941,16 @@ const main = async () => {
   if (isOvertimeCheck) {
     tasks.push(notifyAdminAboutOvertime());
   }
+  if (isAvailabilityCheck) {
+    tasks.push(notifyAvailableConsultants());
+  }
+  if (isAdminMissing) {
+    const period =
+      adminMissingPeriod === "month"
+        ? lastMonthShortfallPeriod()
+        : lastWeekShortfallPeriod();
+    tasks.push(notifyAdminMissingTime(period));
+  }
   if (isTuesday) {
     // Skip Tuesday's weekly nag when today is also the 1st of the month.
     // On those days the 1st-of-month cron sends a month-wide nag which
@@ -1507,7 +1989,7 @@ const main = async () => {
 
   if (tasks.length === 0) {
     console.info(
-      `Nothing scheduled today (run with IS_MONDAY, IS_TUESDAY, IS_OVERTIME, IS_FIRST_OF_MONTH or IS_MONTHLY_RECAP=true to test).`
+      `Nothing scheduled today (run with IS_MONDAY, IS_TUESDAY, IS_OVERTIME, IS_AVAILABILITY, IS_ADMIN_MISSING, IS_FIRST_OF_MONTH or IS_MONTHLY_RECAP=true to test).`
     );
     return;
   }

@@ -1,7 +1,23 @@
 # Floq Timebot
 
-Slack bot that notifies people on Slack when time entries for the previous week
-are missing.
+Slack bot for time tracking and capacity. It started as a nudge for missing
+time entries, and now also posts aggregated overviews to an admin/sales channel.
+
+The bot runs a set of independent flows, each gated by its own `IS_*` env flag.
+A scheduler trigger sets exactly the flags it wants — there is no hidden
+bundling, so every flow can be triggered and tested on its own.
+
+| Flag | Flow | Recipient |
+| ---- | ---- | --------- |
+| `IS_MONDAY` | Weekly digest of last week's hours per person | DM to each employee |
+| `IS_TUESDAY` | Follow-up nudge to people still missing hours for last week | DM to stragglers |
+| `IS_FIRST_OF_MONTH` | Month nudge to people still missing hours for last month | DM to stragglers |
+| `IS_MONTHLY_RECAP` | Monthly recap (FG, bonus, project hours). Derived: fires on the first Monday of the month | DM to each employee |
+| `IS_OVERTIME` | Unpaid registered overtime exists | `#overtid` channel |
+| `IS_AVAILABILITY` | Free capacity (unstaffed days) the next N weeks, per person | capacity channel |
+| `IS_ADMIN_MISSING` | Aggregated table of who is missing time entries | capacity channel |
+
+The capacity channel defaults to `#admin-bemanningogsalg-diskusjon`.
 
 To run:
 
@@ -29,8 +45,30 @@ When testing there are some environment variables available for easier testing:
 
 | Environment Variable | Description                               | Default Value |
 | -------------------- | ----------------------------------------- | ------------- |
-| `DRY_RUN`            | If set to true, no notifications are sent | `false`       |
-| `IS_FIRST_OF_MONTH`  | Simulate running on the 1st of the month  | `false`       |
-| `IS_MONDAY`          | Simulate running on a Monday              | `false`       |
+| `DRY_RUN`            | If set to true, no notifications are sent (preview is logged instead) | `false` |
+| `IS_MONDAY`          | Run the weekly digest                     | `false`       |
+| `IS_TUESDAY`         | Run the Tuesday follow-up nudge           | `false`       |
+| `IS_FIRST_OF_MONTH`  | Run the first-of-month nudge              | `false`       |
+| `IS_MONTHLY_RECAP`   | Force the monthly recap                   | `false`       |
+| `IS_OVERTIME`        | Run the unpaid-overtime check             | `false`       |
+| `IS_AVAILABILITY`    | Run the free-capacity overview            | `false`       |
+| `IS_ADMIN_MISSING`   | Run the aggregated missing-time table     | `false`       |
+
+Flags are read from `process.env` only — the bot does not load a `.env` file.
+To run locally, set them inline (`IS_AVAILABILITY=true DRY_RUN=true node
+dist/index.js`) or export them into your shell.
+
+Configuration knobs (all have sensible defaults):
+
+| Environment Variable | Description | Default Value |
+| -------------------- | ----------- | ------------- |
+| `CAPACITY_CHANNEL` | Channel for the availability and admin-missing overviews | `admin-bemanningogsalg-diskusjon` |
+| `CAPACITY_WEEKS_AHEAD` | How many ISO weeks ahead the availability overview covers | `6` |
+| `ADMIN_MISSING_PERIOD` | Period for `IS_ADMIN_MISSING`: `week` (last week) or `month` (last month) | `week` |
+
+Scheduling note: `IS_ADMIN_MISSING` is independent of the personal-nudge flags.
+To mirror the nudge cadence, set `IS_ADMIN_MISSING=true` on the Monday and
+Tuesday triggers, and `IS_ADMIN_MISSING=true` + `ADMIN_MISSING_PERIOD=month` on
+the first-of-month trigger.
 
 For reverting back to previous versions after testing, delete the latest image from the [Container Registry](https://console.cloud.google.com/gcr/images/marine-cycle-97212/global/github.com/blankoslo/floq-timebot?authuser=1&tab=info) or change the latest tag.
