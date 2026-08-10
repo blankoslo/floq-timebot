@@ -1039,15 +1039,26 @@ const notifyInvoicingResponsible = async () => {
 
   const emailById = new Map(allEmployees.map((e) => [e.id, e.email]));
 
+  let targets = projects;
+  if (TEST_USER_EMAIL) {
+    const before = targets.length;
+    targets = targets.filter(
+      (p) => emailById.get(p.responsible)?.toLowerCase() === TEST_USER_EMAIL
+    );
+    console.info(
+      `TEST_USER_EMAIL=${TEST_USER_EMAIL} — filtered ${before} → ${targets.length} target(s)`
+    );
+  }
+
   const projectsByResponsible = new Map<number, InvoiceProjectRow[]>();
-  for (const p of projects) {
+  for (const p of targets) {
     const list = projectsByResponsible.get(p.responsible);
     if (list) list.push(p);
     else projectsByResponsible.set(p.responsible, [p]);
   }
 
   console.info(
-    `${projects.length} billable project(s) across ${projectsByResponsible.size} oppdragsansvarlig`
+    `${targets.length} billable project(s) across ${projectsByResponsible.size} oppdragsansvarlig`
   );
 
   if (projectsByResponsible.size === 0) {
@@ -1063,8 +1074,6 @@ const notifyInvoicingResponsible = async () => {
       console.warn(`No email for responsible employee ${responsibleId}, skipping`);
       continue;
     }
-    if (TEST_USER_EMAIL && email.toLowerCase() !== TEST_USER_EMAIL) continue;
-
     const targetUser = pickSlackRecipient(slackUsers, email);
     if (!targetUser) {
       console.error(`No Slack user found for ${email}`);
