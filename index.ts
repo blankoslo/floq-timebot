@@ -72,12 +72,12 @@ type ProjectRow = {
   // From floq: "billable" | "non_billable" | "unavailable" (verified via API)
   billable: string;
 };
-// `responsible` (oppdragsansvarlig) is an employees.id, nullable in the DB.
+// `responsible` (oppdragsansvarlig) is an employees.id — nullable in the DB,
+// but the fetcher filters out null rows.
 type InvoiceProjectRow = {
   id: string;
   name: string;
-  billable: string;
-  responsible: number | null;
+  responsible: number;
 };
 type FGPeriodRow = {
   employee_id: number;
@@ -269,11 +269,9 @@ async function fetchAllEmployees(): Promise<EmployeeRow[]> {
 async function fetchActiveBillableProjectsWithResponsible(): Promise<
   InvoiceProjectRow[]
 > {
-  // billable is a text category; only "billable" projects get invoiced.
-  const rows = await apiGet<InvoiceProjectRow[]>(
-    "/projects?select=id,name,billable,responsible&active=eq.true&responsible=not.is.null"
+  return apiGet<InvoiceProjectRow[]>(
+    "/projects?select=id,name,responsible&active=eq.true&billable=eq.billable&responsible=not.is.null"
   );
-  return rows.filter((p) => p.billable === "billable" && p.responsible != null);
 }
 
 // Per-employee fetcher: throws on a real API error. Callers wrap the loop
@@ -996,13 +994,7 @@ const notifyInvoicingResponsible = async () => {
     .add(10, "days")
     .format("YYYY-MM-DD");
 
-  let holidays: HolidayRow[];
-  try {
-    holidays = await fetchHolidays(holStart, holEnd);
-  } catch (err) {
-    console.error("holidays fetch failed:", err);
-    return;
-  }
+  const holidays = await fetchHolidays(holStart, holEnd);
   const holidaySet = new Set(holidays.map((h) => h.date));
 
   // A forward roll from a weekend/holiday month-end lands in the next month, so
@@ -1033,19 +1025,11 @@ const notifyInvoicingResponsible = async () => {
 
   console.info(`Invoicing reminder for ${monthLabel}`);
 
-  let projects: InvoiceProjectRow[];
-  let allEmployees: EmployeeRow[];
-  let slackUsersResp: Awaited<ReturnType<typeof slack.users.list>>;
-  try {
-    [projects, allEmployees, slackUsersResp] = await Promise.all([
-      fetchActiveBillableProjectsWithResponsible(),
-      fetchAllEmployees(),
-      slack.users.list(),
-    ]);
-  } catch (err) {
-    console.error("invoicing reminder fetch failed:", err);
-    return;
-  }
+  const [projects, allEmployees, slackUsersResp] = await Promise.all([
+    fetchActiveBillableProjectsWithResponsible(),
+    fetchAllEmployees(),
+    slack.users.list(),
+  ]);
 
   const slackUsers = slackUsersResp.members;
   if (!slackUsers) {
@@ -1057,10 +1041,9 @@ const notifyInvoicingResponsible = async () => {
 
   const projectsByResponsible = new Map<number, InvoiceProjectRow[]>();
   for (const p of projects) {
-    const id = p.responsible!;
-    const list = projectsByResponsible.get(id);
+    const list = projectsByResponsible.get(p.responsible);
     if (list) list.push(p);
-    else projectsByResponsible.set(id, [p]);
+    else projectsByResponsible.set(p.responsible, [p]);
   }
 
   console.info(
