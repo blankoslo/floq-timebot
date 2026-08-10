@@ -14,6 +14,7 @@ bundling, so every flow can be triggered and tested on its own.
 | `IS_FIRST_OF_MONTH` | Month nudge to people still missing hours for last month | DM to stragglers |
 | `IS_MONTHLY_RECAP` | Monthly recap (FG, bonus, project hours). Derived: fires on the first Monday of the month | DM to each employee |
 | `IS_OVERTIME` | Unpaid registered overtime exists | `#overtid` channel |
+| `IS_INVOICING_REMINDER` | Month-end reminder to invoice. Internal date gate fires it on the last virkedag of the month (rolled forward past weekends/holidays) | DM to each project's oppdragsansvarlig |
 | `IS_AVAILABILITY` | Free capacity (unstaffed days) the next N weeks, per person | capacity channel |
 | `IS_ADMIN_MISSING` | Aggregated table of who is missing time entries | capacity channel |
 
@@ -51,6 +52,8 @@ When testing there are some environment variables available for easier testing:
 | `IS_FIRST_OF_MONTH`  | Run the first-of-month nudge              | `false`       |
 | `IS_MONTHLY_RECAP`   | Force the monthly recap                   | `false`       |
 | `IS_OVERTIME`        | Run the unpaid-overtime check             | `false`       |
+| `IS_INVOICING_REMINDER` | Run the month-end invoicing reminder (still self-gates to the send-day) | `false`  |
+| `INVOICING_REMINDER_FORCE` | Bypass the invoicing send-day gate (targets the previous month) — for testing | `false` |
 | `IS_AVAILABILITY`    | Run the free-capacity overview            | `false`       |
 | `IS_ADMIN_MISSING`   | Run the aggregated missing-time table     | `false`       |
 
@@ -65,10 +68,19 @@ Configuration knobs (all have sensible defaults):
 | `CAPACITY_CHANNEL` | Channel for the availability and admin-missing overviews | `admin-bemanningogsalg-diskusjon` |
 | `CAPACITY_WEEKS_AHEAD` | How many ISO weeks ahead the availability overview covers | `6` |
 | `ADMIN_MISSING_PERIOD` | Period for `IS_ADMIN_MISSING`: `week` (last week) or `month` (last month) | `week` |
+| `FLOQ_INVOICE_URL` | Link in the invoicing reminder | `https://inni.blank.no/invoice` |
 
 Scheduling note: `IS_ADMIN_MISSING` is independent of the personal-nudge flags.
 To mirror the nudge cadence, set `IS_ADMIN_MISSING=true` on the Monday and
 Tuesday triggers, and `IS_ADMIN_MISSING=true` + `ADMIN_MISSING_PERIOD=month` on
 the first-of-month trigger.
+
+Scheduling note for `IS_INVOICING_REMINDER`: schedule a trigger that fires it
+**every weekday** with `IS_INVOICING_REMINDER=true`. The flow self-gates — it
+only sends on the month's last virkedag, rolled forward past weekends and
+holidays (so if the last day is a Saturday it lands the following Monday). Every
+other weekday it exits after one cheap holidays lookup. Firing it monthly would
+be wrong: the exact send date shifts month to month, so a fixed cron can't hit
+it.
 
 For reverting back to previous versions after testing, delete the latest image from the [Container Registry](https://console.cloud.google.com/gcr/images/marine-cycle-97212/global/github.com/blankoslo/floq-timebot?authuser=1&tab=info) or change the latest tag.
