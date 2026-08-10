@@ -1481,9 +1481,7 @@ const notifyLateRegisterers = async (period: ShortfallPeriod) => {
 // DMs.
 //
 // Honours week_balance_confirmations on the same terms as the personal nudge,
-// via period.confirmationWeek. So on the weekly run the table lists exactly
-// the people who got DM'd, and someone who confirmed the gap as avspasering is
-// off both.
+// via period.confirmationWeek.
 
 type MissingTimeRow = {
   name: string;
@@ -1579,8 +1577,6 @@ const notifyAdminMissingTime = async (period: ShortfallPeriod) => {
   });
 
   // Absence-calendar tolerance: marked weekday absence explains part of a gap.
-  // Confirmed avspasering excuses the rest, but only when the period is a
-  // single ISO week — a month-long period has no confirmation to look up.
   const [allAbsences, allEmployees, confirmedByEmployee] = await Promise.all([
     fetchAllAbsencesForWeek(startStr, endStr),
     fetchAllEmployees(),
