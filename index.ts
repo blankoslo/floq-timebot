@@ -1062,7 +1062,7 @@ const notifyInvoicingResponsible = async () => {
   );
 
   if (projectsByResponsible.size === 0) {
-    console.info("No projects with an oppdragsansvarlig — nothing to send.");
+    console.info("Nothing to send for invoicing reminder.");
     return;
   }
 
