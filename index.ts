@@ -9,6 +9,8 @@ const slack = new WebClient(process.env.SLACK_API_TOKEN || "");
 const DRY_RUN = process.env.DRY_RUN === "true";
 const FLOQ_TIMESTAMP_URL =
   process.env.FLOQ_TIMESTAMP_URL || "https://inni.blank.no/timestamp/";
+const FLOQ_INVOICE_URL =
+  process.env.FLOQ_INVOICE_URL || "https://inni.blank.no/invoice";
 // When set, only this employee's data is processed (filters the target
 // list) — useful for previewing how a real Slack render looks without
 // spamming everyone.
@@ -77,6 +79,13 @@ type ProjectRow = {
   name: string;
   // From floq: "billable" | "non_billable" | "unavailable" (verified via API)
   billable: string;
+};
+// `responsible` (oppdragsansvarlig) is an employees.id — nullable in the DB,
+// but the fetcher filters out null rows.
+type InvoiceProjectRow = {
+  id: string;
+  name: string;
+  responsible: number;
 };
 type FGPeriodRow = {
   employee_id: number;
@@ -189,6 +198,10 @@ const isAvailabilityCheck = process.env.IS_AVAILABILITY === "true";
 const isAdminMissing = process.env.IS_ADMIN_MISSING === "true";
 const adminMissingPeriod =
   process.env.ADMIN_MISSING_PERIOD === "month" ? "month" : "week";
+// Fired every weekday; notifyInvoicingResponsible self-gates to the send day.
+// INVOICING_REMINDER_FORCE bypasses that gate for testing (previous month).
+const isInvoicingReminder = process.env.IS_INVOICING_REMINDER === "true";
+const invoicingReminderForce = process.env.INVOICING_REMINDER_FORCE === "true";
 // The monthly recap rides along with the Monday run, but only on the first
 // Monday of the month (date 1–7) — by then every "majority-of-days-in-
 // previous-month" week has finished, so bonus + FG are stable. No separate
@@ -267,6 +280,14 @@ async function fetchWeekBalanceConfirmations(
   return apiGet<WeekBalanceConfirmationRow[]>(
     `/week_balance_confirmations?select=employee,week_start,minutes,confirmed` +
       `&week_start=eq.${monday}&confirmed=is.true`
+  );
+}
+
+async function fetchActiveBillableProjectsWithResponsible(): Promise<
+  InvoiceProjectRow[]
+> {
+  return apiGet<InvoiceProjectRow[]>(
+    "/projects?select=id,name,responsible&active=eq.true&billable=eq.billable&responsible=not.is.null"
   );
 }
 
@@ -936,6 +957,190 @@ const notifyAdminAboutOvertime = async () => {
     console.info(`Sent to #${channelName}`);
   } catch (err) {
     console.error(`Failed to post to #${channelName}:`, err);
+  }
+};
+
+// === Reminder til oppdragsansvarlig: fakturering ===
+//
+// DM every project's oppdragsansvarlig (projects.responsible) to invoice the
+// just-finished month. Send-day: the month's last day if it's a virkedag, else
+// rolled forward to the next virkedag (past weekends and holidays).
+
+// Last day of monthAnchor's month, rolled forward to the first virkedag on or
+// after it (isoWeekday 6/7 = Sat/Sun).
+function invoicingReminderSendDate(
+  monthAnchor: moment.Moment,
+  holidaySet: Set<string>
+): moment.Moment {
+  const d = monthAnchor.clone().endOf("month").startOf("day");
+  while (d.isoWeekday() >= 6 || holidaySet.has(d.format("YYYY-MM-DD"))) {
+    d.add(1, "day");
+  }
+  return d;
+}
+
+function buildInvoicingReminderMessage(
+  monthLabel: string,
+  projects: InvoiceProjectRow[]
+): { text: string; blocks: Array<Record<string, unknown>> } {
+  const projectLines = projects.map((p) => `• ${p.name} (${p.id})`).join("\n");
+  const ownsClause =
+    projects.length === 1
+      ? "dette oppdraget"
+      : `disse ${projects.length} oppdragene`;
+  const intro =
+    `Det er på tide å fakturere for *${monthLabel}* 🧾\n` +
+    `Du står som oppdragsansvarlig for ${ownsClause}:`;
+  const message = `${intro}\n${projectLines}`;
+
+  const text =
+    message.replace(/\*/g, "") + `\n\nÅpne fakturering: ${FLOQ_INVOICE_URL}`;
+
+  const blocks: Array<Record<string, unknown>> = [
+    { type: "section", text: { type: "mrkdwn", text: message } },
+    {
+      type: "actions",
+      elements: [
+        {
+          type: "button",
+          text: { type: "plain_text", text: "Åpne fakturering i Floq" },
+          url: FLOQ_INVOICE_URL,
+        },
+      ],
+    },
+  ];
+
+  return { text, blocks };
+}
+
+const notifyInvoicingResponsible = async () => {
+  const today = moment().startOf("day");
+
+  // Covers both roll windows: last month's start through past this month's end.
+  const holStart = today
+    .clone()
+    .subtract(1, "month")
+    .startOf("month")
+    .format("YYYY-MM-DD");
+  const holEnd = today
+    .clone()
+    .endOf("month")
+    .add(10, "days")
+    .format("YYYY-MM-DD");
+
+  const holidays = await fetchHolidays(holStart, holEnd);
+  const holidaySet = new Set(holidays.map((h) => h.date));
+
+  // A forward roll from a weekend/holiday month-end lands in the next month, so
+  // today's send-day may belong to this month (case A) or last month (case B).
+  let coveredMonth: moment.Moment;
+  if (invoicingReminderForce) {
+    coveredMonth = today.clone().subtract(1, "month");
+    console.info("INVOICING_REMINDER_FORCE — covering previous month.");
+  } else {
+    const thisMonthSend = invoicingReminderSendDate(today, holidaySet);
+    const prevMonthSend = invoicingReminderSendDate(
+      today.clone().subtract(1, "month"),
+      holidaySet
+    );
+    if (today.isSame(thisMonthSend, "day")) {
+      coveredMonth = today.clone();
+    } else if (today.isSame(prevMonthSend, "day")) {
+      coveredMonth = today.clone().subtract(1, "month");
+    } else {
+      const next = thisMonthSend.isAfter(today) ? thisMonthSend : prevMonthSend;
+      console.info(
+        `Not an invoicing reminder day (today=${today.format("YYYY-MM-DD")}, next=${next.format("YYYY-MM-DD")}). Skipping.`
+      );
+      return;
+    }
+  }
+  const monthLabel = coveredMonth.format("MMMM YYYY");
+
+  console.info(`Invoicing reminder for ${monthLabel}`);
+
+  const [projects, allEmployees, slackUsersResp] = await Promise.all([
+    fetchActiveBillableProjectsWithResponsible(),
+    fetchAllEmployees(),
+    slack.users.list(),
+  ]);
+
+  const slackUsers = slackUsersResp.members;
+  if (!slackUsers) {
+    console.error("No slack users in response");
+    return;
+  }
+
+  const emailById = new Map(allEmployees.map((e) => [e.id, e.email]));
+
+  let targets = projects;
+  if (TEST_USER_EMAIL) {
+    const before = targets.length;
+    targets = targets.filter(
+      (p) => emailById.get(p.responsible)?.toLowerCase() === TEST_USER_EMAIL
+    );
+    console.info(
+      `TEST_USER_EMAIL=${TEST_USER_EMAIL} — filtered ${before} → ${targets.length} target(s)`
+    );
+  }
+
+  const projectsByResponsible = new Map<number, InvoiceProjectRow[]>();
+  for (const p of targets) {
+    const list = projectsByResponsible.get(p.responsible);
+    if (list) list.push(p);
+    else projectsByResponsible.set(p.responsible, [p]);
+  }
+
+  console.info(
+    `${targets.length} billable project(s) across ${projectsByResponsible.size} oppdragsansvarlig`
+  );
+
+  if (projectsByResponsible.size === 0) {
+    console.info("Nothing to send for invoicing reminder.");
+    return;
+  }
+
+  for (const [responsibleId, ownedProjects] of Array.from(
+    projectsByResponsible
+  )) {
+    const email = emailById.get(responsibleId);
+    if (!email) {
+      console.warn(`No email for responsible employee ${responsibleId}, skipping`);
+      continue;
+    }
+    const targetUser = pickSlackRecipient(slackUsers, email);
+    if (!targetUser) {
+      console.error(`No Slack user found for ${email}`);
+      continue;
+    }
+
+    ownedProjects.sort((a, b) => a.name.localeCompare(b.name, "nb"));
+
+    const { text, blocks } = buildInvoicingReminderMessage(
+      monthLabel,
+      ownedProjects
+    );
+
+    console.info(
+      `Invoicing reminder → @${targetUser.name} (${email}) — ${ownedProjects.length} prosjekt(er)`
+    );
+
+    if (DRY_RUN) {
+      console.info("DRY_RUN — message preview:\n" + text);
+      continue;
+    }
+
+    try {
+      await slack.chat.postMessage({
+        channel: targetUser.id!,
+        text,
+        blocks: blocks as any,
+        as_user: true,
+      });
+      console.info(`Sent to @${targetUser.name}`);
+    } catch (err) {
+      console.error(`Failed to send to @${targetUser.name}:`, err);
+    }
   }
 };
 
@@ -2035,6 +2240,9 @@ const main = async () => {
   if (isAvailabilityCheck) {
     tasks.push(notifyAvailableConsultants());
   }
+  if (isInvoicingReminder) {
+    tasks.push(notifyInvoicingResponsible());
+  }
   if (isAdminMissing) {
     const period =
       adminMissingPeriod === "month"
@@ -2080,7 +2288,7 @@ const main = async () => {
 
   if (tasks.length === 0) {
     console.info(
-      `Nothing scheduled today (run with IS_MONDAY, IS_TUESDAY, IS_OVERTIME, IS_AVAILABILITY, IS_ADMIN_MISSING, IS_FIRST_OF_MONTH or IS_MONTHLY_RECAP=true to test).`
+      `Nothing scheduled today (run with IS_MONDAY, IS_TUESDAY, IS_OVERTIME, IS_AVAILABILITY, IS_INVOICING_REMINDER, IS_ADMIN_MISSING, IS_FIRST_OF_MONTH or IS_MONTHLY_RECAP=true to test).`
     );
     return;
   }
