@@ -669,7 +669,10 @@ function summarize(
 ): string {
   const totalDays = emptyDays + partialDays;
   const missingLabel = `*${formatHoursShort(missingHours)} time${missingHours === 1 ? "" : "r"}*`;
-  const closing = "Ser du over og evt. fører resten? 🙏";
+  const closing =
+    emptyDays === 0
+      ? "Ser du over og enten bekrefter avspasering eller fører resten? 🙏"
+      : "Ser du over og evt. fører resten? 🙏";
 
   if (totalDays === 0) {
     return `Du mangler totalt ${missingLabel}. ${closing}`;
@@ -1434,18 +1437,19 @@ function buildLateRegisterMessage(
   missingDays: number
 ): { text: string; blocks: Array<Record<string, unknown>> } {
   const hoursLabel = `*${formatHoursShort(missingHours)} time${missingHours === 1 ? "" : "r"}*`;
-  // The day count comes from the API's unregistered_days, which only counts
-  // fully empty workdays. Drop the "fordelt på N dager" clause when it's 0
-  // (someone with only partial days) to avoid the awkward "0 dager".
-  const daysClause =
-    missingDays > 0
-      ? ` fordelt på ${missingDays === 1 ? "*1 dag*" : `*${missingDays} dager*`}`
-      : "";
+  const daysLabel = missingDays === 1 ? "*1 dag*" : `*${missingDays} dager*`;
 
+  // The day count comes from the API's unregistered_days, which only counts
+  // fully empty workdays. At 0 the gap sits in partial days, more likely
+  // avspasering than forgotten timeføring, so ask for a confirmation instead
+  // (and skip the "fordelt på N dager" clause, which would read "0 dager").
   const message =
-    `Du mangler fortsatt ${hoursLabel}${daysClause} for *${periodLabel}*. ` +
-    `Husk at avspasering skal markeres i fraværskalender og at ferie- og permisjonsdager også skal timeføres. ` +
-    `Ser du over og evt. fører resten? 🙏`;
+    missingDays === 0
+      ? `Du mangler fortsatt ${hoursLabel} for *${periodLabel}*. ` +
+        `Ser du over og enten bekrefter avspasering eller fører resten? 🙏`
+      : `Du mangler fortsatt ${hoursLabel} fordelt på ${daysLabel} for *${periodLabel}*. ` +
+        `Husk at avspasering skal markeres i fraværskalender og at ferie- og permisjonsdager også skal timeføres. ` +
+        `Ser du over og evt. fører resten? 🙏`;
 
   const text =
     message.replace(/\*/g, "") +
