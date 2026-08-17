@@ -481,14 +481,14 @@ const DAY_NAMES_NB = [
   "Lørdag",
 ];
 
-function statusIcon(s: DayStatus): string {
+function statusIcon(s: DayStatus, gapConfirmed = false): string {
   // Per design: only flag days that warrant attention. Complete days and
   // absence days don't need a visual marker — the row already conveys it.
   switch (s) {
     case "partial":
-      return "⚠️";
+      return gapConfirmed ? "" : "⚠️";
     case "empty":
-      return "⛔️";
+      return gapConfirmed ? "" : "⛔️";
     case "holiday":
       return "🗓️";
     default:
@@ -516,10 +516,13 @@ function textCell(text: string): Record<string, unknown> {
   return { type: "raw_text", text: text.length > 0 ? text : " " };
 }
 
-function buildTableRow(day: DayBreakdown): Record<string, unknown>[] {
+function buildTableRow(
+  day: DayBreakdown,
+  gapConfirmed = false
+): Record<string, unknown>[] {
   const m = moment(day.date);
   const dayDateLabel = `${DAY_NAMES_NB[m.day()]} ${m.format("D. MMMM")}`;
-  const icon = statusIcon(day.status);
+  const icon = statusIcon(day.status, gapConfirmed);
   const hoursStr = `${formatHours(day.hoursActual)} t`;
 
   if (day.status === "holiday") {
@@ -581,7 +584,8 @@ function buildTableRow(day: DayBreakdown): Record<string, unknown>[] {
 function buildTableBlock(
   days: DayBreakdown[],
   totalActual: number,
-  totalExpected: number
+  totalExpected: number,
+  gapConfirmed = false
 ): Record<string, unknown> {
   const headerRow = [
     headerCell("Dag"),
@@ -589,7 +593,7 @@ function buildTableBlock(
     headerCell("Prosjekt"),
     headerCell("Status"),
   ];
-  const dataRows = days.map(buildTableRow);
+  const dataRows = days.map((d) => buildTableRow(d, gapConfirmed));
   const totalRow = [
     headerCell("Totalt"),
     headerCell(`${formatHours(totalActual)} t`),
@@ -609,7 +613,7 @@ function buildTableBlock(
   };
 }
 
-function formatPerDayLine(day: DayBreakdown): string {
+function formatPerDayLine(day: DayBreakdown, gapConfirmed = false): string {
   // The day is implicit from row order (Mon–Fri matches the period in the
   // headline), so we skip the prefix entirely. This sidesteps the alignment
   // problem entirely and keeps each row to its essentials.
@@ -632,7 +636,7 @@ function formatPerDayLine(day: DayBreakdown): string {
   const hoursStr = formatHours(day.hoursActual);
 
   if (day.status === "empty") {
-    return `${hoursStr} t ⛔️`;
+    return `${hoursStr} t ${statusIcon(day.status, gapConfirmed)}`.trimEnd();
   }
 
   // complete or partial — show hours and project(s)
@@ -642,7 +646,8 @@ function formatPerDayLine(day: DayBreakdown): string {
         (day.projects.length > 3 ? " m.fl." : "")
       : "-";
   const base = `${hoursStr} t (${projectStr})`;
-  return day.status === "partial" ? `${base} ⚠️` : base;
+  const icon = statusIcon(day.status, gapConfirmed);
+  return icon ? `${base} ${icon}` : base;
 }
 
 const numberWord = (n: number): string => {
@@ -697,7 +702,8 @@ function buildSlackMessage(
   days: DayBreakdown[],
   totalActual: number,
   totalExpected: number,
-  hasIssues: boolean
+  hasIssues: boolean,
+  gapConfirmed = false
 ): { text: string; blocks: Array<Record<string, unknown>> } {
   const weekNumber = startDate.isoWeek();
   // Display the work week (mon–fri) rather than the calendar week (mon–sun).
@@ -712,7 +718,9 @@ function buildSlackMessage(
   const lastDate = displayEnd.format("D. MMMM");
   const periodLabel = `uke ${weekNumber} (${firstDate}-${lastDate})`;
 
-  const perDayLines = days.map(formatPerDayLine).join("\n");
+  const perDayLines = days
+    .map((d) => formatPerDayLine(d, gapConfirmed))
+    .join("\n");
 
   const emptyDays = days.filter((d) => d.status === "empty").length;
   const partialDays = days.filter((d) => d.status === "partial").length;
@@ -756,7 +764,9 @@ function buildSlackMessage(
   // Slack moves the table to the bottom of the message as an attachment
   // regardless of where it sits in the blocks array — so order here is
   // for the API, not for visual flow.
-  blocks.push(buildTableBlock(days, totalActual, totalExpected));
+  blocks.push(
+    buildTableBlock(days, totalActual, totalExpected, gapConfirmed)
+  );
 
   return { text, blocks };
 }
@@ -892,7 +902,8 @@ const notifySlackers = async () => {
       days,
       totalActual,
       totalExpected,
-      hasIssues
+      hasIssues,
+      confirmedCoversGap
     );
 
     const emptyDays = days.filter((d) => d.status === "empty").length;
