@@ -131,7 +131,7 @@ type DayBreakdown = {
 
 // === API helpers ===
 const apiToken = () =>
-  jwt.sign({ role: "root" }, process.env.API_JWT_SECRET || "dev-secret-shhh");
+  jwt.sign({ role: "read_only" }, process.env.API_JWT_SECRET || "dev-secret-shhh");
 
 // Pick which Slack user to DM. Honors TEST_USER_SLACK_EMAIL override so we
 // can impersonate someone else's data while having the message land in our
