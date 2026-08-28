@@ -3,7 +3,7 @@
   "version": "1.0.0",
   "description": "Slack bot that notifies people about missing time entries",
   "type": "module",
-  "main": "index.js",
+  "main": "dist/index.js",
   "repository": "git@github.com:blankoslo/floq-timebot.git",
   "author": "Erlend Hamberg",
   "license": "UNLICENCED",
