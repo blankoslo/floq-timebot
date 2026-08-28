@@ -1,7 +1,7 @@
 # Two stages so the shipped image only carries production dependencies —
-# tsup's build tooling (typescript, tsup, esbuild) never ends up in the final
-# image. tsup externalizes package.json dependencies rather than bundling
-# them, so the runtime stage still needs its own `npm ci --omit=dev`.
+# typescript never ends up in the final image. tsc doesn't bundle
+# package.json dependencies into its output, so the runtime stage still
+# needs its own `npm ci --omit=dev`.
 FROM node:22-alpine AS build
 
 WORKDIR /timebot
@@ -9,7 +9,7 @@ WORKDIR /timebot
 COPY package.json package-lock.json tsconfig.json /timebot/
 RUN npm ci
 
-COPY index.ts /timebot/index.ts
+COPY src /timebot/src
 RUN npm run build
 
 FROM node:22-alpine
