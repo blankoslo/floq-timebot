@@ -37,7 +37,31 @@ https://console.cloud.google.com/run/jobs/details/europe-north1/floq-prod-timebo
 
 # Testing
 
-There is no separate testing environment. In order to test:
+The bot authenticates to Floq as the `floq-prod-timebot` service account. Anyone in
+`alle@blank.no` can impersonate it locally, so you can run the bot against Floq's
+test environment (`api-test.floq.no`) without deploying first:
+
+    gcloud auth application-default login --impersonate-service-account=floq-prod-timebot@marine-cycle-97212.iam.gserviceaccount.com
+    DRY_RUN=true IS_AVAILABILITY=true node dist/index.js
+
+`API_URI` and `FLOQ_AUTH_BASE_URL` already default to the test environment, so no
+further env vars are needed for a local run. `SLACK_API_TOKEN` still points at the
+real Slack workspace — `DRY_RUN=true` logs the rendered preview instead of sending
+it, so this is safe even without setting `TEST_USER_EMAIL`/`TEST_USER_SLACK_EMAIL`.
+
+This impersonation changes your machine-wide Application Default Credentials —
+every local tool that resolves ADC will act as `floq-prod-timebot` until you log
+back in normally (`gcloud auth application-default login`) or revoke
+(`gcloud auth application-default revoke`).
+
+The same local setup also works against production data (still read-only) —
+just point at prod:
+
+    API_URI=https://api-prod.floq.no FLOQ_AUTH_BASE_URL=https://inni.blank.no \
+    DRY_RUN=true IS_AVAILABILITY=true node dist/index.js
+
+Deploying is only needed to verify the actual built container / Cloud Run Job
+end-to-end:
 
 1. Deploy a new version to production.
 2. Execute the [Cloud Run Job](https://console.cloud.google.com/run/jobs/details/europe-north1/floq-prod-timebot/executions?authuser=1&project=marine-cycle-97212&supportedpurview=project) with overrides and add the env variable `DRY_RUN=true`. Execute with overrides is available through the drop-down next to the execute button.

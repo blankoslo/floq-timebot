@@ -15,8 +15,10 @@ RUN npm run build
 FROM node:22-alpine
 
 # Required ENV variables:
-# - API_JWT_SECRET (secret shared with floq-api)
-# - API_URI
+# - API_URI (Floq's PostgREST API)
+# - FLOQ_AUTH_BASE_URL (Floq's own app — exchanges this job's service-account
+#   identity for a short-lived API_URI access token)
+# - FLOQ_SERVICE_TOKEN_AUDIENCE (defaults to FLOQ_AUTH_BASE_URL)
 # - SLACK_API_TOKEN
 
 WORKDIR /timebot
