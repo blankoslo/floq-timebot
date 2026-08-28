@@ -1,14 +1,17 @@
 {
     "compilerOptions": {
-      "module": "commonjs",
+      "module": "NodeNext",
+      "moduleResolution": "NodeNext",
       "target": "ES2020",
+      "outDir": "dist",
+      "rootDir": "src",
       "noImplicitAny": true,
       "removeComments": true,
       "preserveConstEnums": true,
       "sourceMap": true,
       "esModuleInterop": true
     },
-    "files": [
-      "index.ts"
+    "include": [
+      "src/**/*.ts"
     ]
   }
