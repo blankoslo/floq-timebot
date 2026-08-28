@@ -59,7 +59,14 @@ type TimeTrackingStatusRow = {
   last_created: string | null;
 };
 
-type EmployeeRow = { id: number; email: string };
+type EmployeeRow = {
+  id: number;
+  email: string;
+  // Both nullable in the DB. A null date_of_employment means "employed for as
+  // long as we care about"; a null termination_date means "still here".
+  date_of_employment: string | null;
+  termination_date: string | null;
+};
 type HolidayRow = { date: string; name: string };
 type AbsenceRow = {
   date: string;
@@ -276,15 +283,6 @@ async function fetchTimeTrackingStatus(
   });
 }
 
-async function fetchEmployeeIdByEmail(email: string): Promise<number | null> {
-  // Throws on a real API error (caller's loop skips the employee). Returns
-  // null only when the employee genuinely isn't found.
-  const rows = await apiGet<EmployeeRow[]>(
-    `/employees?select=id&email=eq.${encodeURIComponent(email)}`
-  );
-  return rows[0]?.id ?? null;
-}
-
 // Bulk fetchers below intentionally do NOT catch — a failed shared fetch
 // must abort the whole run (the error propagates to main's allSettled and
 // no messages go out) rather than silently degrade every message.
@@ -318,7 +316,9 @@ async function fetchAllAbsencesForWeek(
 }
 
 async function fetchAllEmployees(): Promise<EmployeeRow[]> {
-  return apiGet<EmployeeRow[]>("/employees?select=id,email");
+  return apiGet<EmployeeRow[]>(
+    "/employees?select=id,email,date_of_employment,termination_date"
+  );
 }
 
 async function fetchWeekBalanceConfirmations(
@@ -380,6 +380,71 @@ async function fetchAllMonthlyBonuses(
     `/rpc/fg_bonus_employee_monthly?year=${year}&month=${month}`
   );
   return new Map(rows.map((r) => [r.employee_id, r.bonus]));
+}
+
+// === Employment window ===
+//
+// `time_tracking_status` already clamps available_hours to the employment
+// window, but nothing else does — so a mid-week starter got the day before
+// their first day reported as ❌ 0 av 7,5 t, and the same for the days after
+// a leaver's last. Clamp the reporting period per employee instead.
+// (blankoslo/floq-timebot#3)
+
+type EmploymentWindow = Pick<
+  EmployeeRow,
+  "date_of_employment" | "termination_date"
+>;
+
+// Narrows [startDate, endDate] to the part the employee was actually
+// employed. Returns null when the two don't overlap at all — the employee has
+// nothing to answer for in this period and should be skipped.
+function clampToEmployment(
+  startDate: moment.Moment,
+  endDate: moment.Moment,
+  employee: EmploymentWindow
+): { startDate: moment.Moment; endDate: moment.Moment } | null {
+  let start = startDate;
+  let end = endDate;
+
+  if (employee.date_of_employment) {
+    const hired = moment(employee.date_of_employment, "YYYY-MM-DD");
+    if (hired.isAfter(start, "day")) start = hired;
+  }
+  if (employee.termination_date) {
+    const left = moment(employee.termination_date, "YYYY-MM-DD");
+    if (left.isBefore(end, "day")) end = left;
+  }
+
+  return start.isAfter(end, "day") ? null : { startDate: start, endDate: end };
+}
+
+// Workdays (mon–fri, holidays excluded) inside [startDate, endDate] that fall
+// outside the employment window. `unregistered_days` from time_tracking_status
+// counts every such day regardless of employment, so subtract these before
+// telling anyone how many days they're missing.
+function unemployedWorkdays(
+  startDate: moment.Moment,
+  endDate: moment.Moment,
+  employee: EmploymentWindow,
+  holidays: HolidayRow[]
+): number {
+  const holidayDates = new Set(holidays.map((h) => h.date));
+  const window = clampToEmployment(startDate, endDate, employee);
+
+  let count = 0;
+  const cur = startDate.clone();
+  while (cur.isSameOrBefore(endDate, "day")) {
+    const day = cur.isoWeekday();
+    const ds = cur.format("YYYY-MM-DD");
+    const isWorkday = day <= 5 && !holidayDates.has(ds);
+    const employed =
+      window !== null &&
+      cur.isSameOrAfter(window.startDate, "day") &&
+      cur.isSameOrBefore(window.endDate, "day");
+    if (isWorkday && !employed) count += 1;
+    cur.add(1, "day");
+  }
+  return count;
 }
 
 // === Per-day breakdown ===
@@ -755,8 +820,10 @@ function buildSlackMessage(
   const weekNumber = startDate.isoWeek();
   // Display the work week (mon–fri) rather than the calendar week (mon–sun).
   // For 1st-of-month partial-week runs, cap at endDate so we don't claim
-  // dates that haven't happened yet.
-  const fridayOfWeek = startDate.clone().add(4, "days");
+  // dates that haven't happened yet. Friday is anchored on the ISO week, not
+  // on startDate + 4 — startDate is clamped to the employment window and so
+  // isn't necessarily the Monday.
+  const fridayOfWeek = startDate.clone().startOf("isoWeek").add(4, "days");
   const displayEnd = endDate.isBefore(fridayOfWeek) ? endDate : fridayOfWeek;
   const sameMonth = startDate.month() === displayEnd.month();
   const firstDate = sameMonth
@@ -868,13 +935,19 @@ const notifySlackers = async () => {
   }
 
   // Fetch shared data once
-  const [holidays, projectInfo, slackUsersResp, confirmedByEmployee] =
-    await Promise.all([
-      fetchHolidays(startStr, endStr),
-      fetchProjectInfoMap(),
-      slack.users.list(),
-      fetchConfirmedShortfallHours(startStr),
-    ]);
+  const [
+    holidays,
+    projectInfo,
+    allEmployees,
+    slackUsersResp,
+    confirmedByEmployee,
+  ] = await Promise.all([
+    fetchHolidays(startStr, endStr),
+    fetchProjectInfoMap(),
+    fetchAllEmployees(),
+    slack.users.list(),
+    fetchConfirmedShortfallHours(startStr),
+  ]);
 
   const slackUsers = slackUsersResp.members;
   if (!slackUsers) {
@@ -882,26 +955,47 @@ const notifySlackers = async () => {
     return;
   }
 
+  const employeeByEmail = new Map(
+    allEmployees.map((e) => [e.email.toLowerCase(), e])
+  );
+
   for (const row of targets) {
-    // Per-employee fetches are wrapped so one person's API failure skips
-    // just them (loud) rather than sending a wrong message or aborting the
-    // whole run.
-    let employeeId: number | null;
+    const employee = employeeByEmail.get(row.email.toLowerCase());
+    if (!employee) {
+      console.warn(`No employee row for ${row.email}, skipping`);
+      continue;
+    }
+    const employeeId = employee.id;
+
+    // Report on the part of the week the person was actually employed, so a
+    // mid-week starter isn't shown ❌ for the days before their first.
+    const period = clampToEmployment(startDate, endDate, employee);
+    if (!period) {
+      console.info(
+        `Skipping ${row.email}: not employed in ${startStr} → ${endStr}`
+      );
+      continue;
+    }
+    const periodStartStr = period.startDate.format("YYYY-MM-DD");
+    const periodEndStr = period.endDate.format("YYYY-MM-DD");
+
+    // Per-employee fetch is wrapped so one person's API failure skips just
+    // them (loud) rather than sending a wrong message or aborting the whole
+    // run.
     let projectRows: ProjectHoursPerDayRow[];
     try {
-      employeeId = await fetchEmployeeIdByEmail(row.email);
-      if (!employeeId) {
-        console.warn(`No employee_id for ${row.email}, skipping`);
-        continue;
-      }
-      projectRows = await fetchProjectHoursPerDay(employeeId, startStr, endStr);
+      projectRows = await fetchProjectHoursPerDay(
+        employeeId,
+        periodStartStr,
+        periodEndStr
+      );
     } catch (err) {
       console.error(`Skipping ${row.email} — fetch failed:`, err);
       continue;
     }
     const days = buildPerDayBreakdown(
-      startDate,
-      endDate,
+      period.startDate,
+      period.endDate,
       projectRows,
       holidays,
       projectInfo
@@ -944,8 +1038,8 @@ const notifySlackers = async () => {
     const hasIssues = hasShortfall && !isMonthlyRecap && !confirmedCoversGap;
 
     const { text, blocks } = buildSlackMessage(
-      startDate,
-      endDate,
+      period.startDate,
+      period.endDate,
       days,
       totalActual,
       totalExpected,
@@ -1632,13 +1726,15 @@ const notifyLateRegisterers = async (period: ShortfallPeriod) => {
     return;
   }
 
-  // Fetch absence calendar + employees + slack users in parallel. Bulk
-  // queries instead of per-employee loops.
-  const [allAbsences, allEmployees, slackUsersResp] = await Promise.all([
-    fetchAllAbsencesForWeek(startStr, endStr),
-    fetchAllEmployees(),
-    slack.users.list(),
-  ]);
+  // Fetch absence calendar + employees + holidays + slack users in parallel.
+  // Bulk queries instead of per-employee loops.
+  const [allAbsences, allEmployees, holidays, slackUsersResp] =
+    await Promise.all([
+      fetchAllAbsencesForWeek(startStr, endStr),
+      fetchAllEmployees(),
+      fetchHolidays(startStr, endStr),
+      slack.users.list(),
+    ]);
 
   const slackUsers = slackUsersResp.members;
   if (!slackUsers) {
@@ -1646,9 +1742,9 @@ const notifyLateRegisterers = async (period: ShortfallPeriod) => {
     return;
   }
 
-  // Build lookup: email → employee_id (lowercased emails)
-  const idByEmail = new Map(
-    allEmployees.map((e) => [e.email.toLowerCase(), e.id])
+  // Build lookup: email → employee row (lowercased emails)
+  const employeeByEmail = new Map(
+    allEmployees.map((e) => [e.email.toLowerCase(), e])
   );
 
   // Build lookup: employee_id → number of weekday absence calendar entries
@@ -1674,7 +1770,8 @@ const notifyLateRegisterers = async (period: ShortfallPeriod) => {
     const apiMissing =
       row.available_hours - row.billable_hours - row.non_billable_hours;
 
-    const employeeId = idByEmail.get(row.email.toLowerCase());
+    const employee = employeeByEmail.get(row.email.toLowerCase());
+    const employeeId = employee?.id;
     const absenceDays = employeeId
       ? absenceWeekdaysByEmployee.get(employeeId) ?? 0
       : 0;
@@ -1691,7 +1788,15 @@ const notifyLateRegisterers = async (period: ShortfallPeriod) => {
     // Subtract the absence-explained portion from both totals shown in the
     // message so the user sees the remaining real gap.
     const missingHours = apiMissing - toleratedByAbsence;
-    const missingDays = Math.max(0, row.unregistered_days - absenceDays);
+    // unregistered_days isn't clamped to the employment window, so drop the
+    // workdays before a new hire started (or after a leaver's last day).
+    const notEmployedDays = employee
+      ? unemployedWorkdays(startDate, endDate, employee, holidays)
+      : 0;
+    const missingDays = Math.max(
+      0,
+      row.unregistered_days - absenceDays - notEmployedDays
+    );
 
     // The user has already owned up to this week as avspasering, so don't nag
     // about it. Bare >= is Floq's own isBalanceConfirmed rule: the
@@ -2172,6 +2277,7 @@ const notifyMonthlyRecap = async () => {
   const [
     allEmployees,
     allAbsences,
+    holidays,
     projectInfo,
     bonusByEmployee,
     fgByEmployee,
@@ -2179,6 +2285,7 @@ const notifyMonthlyRecap = async () => {
   ] = await Promise.all([
     fetchAllEmployees(),
     fetchAllAbsencesForWeek(startStr, endStr),
+    fetchHolidays(startStr, endStr),
     fetchProjectInfoMap(),
     fetchAllMonthlyBonuses(year, month),
     fetchAllFGForRange(startStr, endStr),
@@ -2191,8 +2298,8 @@ const notifyMonthlyRecap = async () => {
     return;
   }
 
-  const idByEmail = new Map(
-    allEmployees.map((e) => [e.email.toLowerCase(), e.id])
+  const employeeByEmail = new Map(
+    allEmployees.map((e) => [e.email.toLowerCase(), e])
   );
 
   const absenceWeekdaysByEmployee = new Map<number, number>();
@@ -2206,11 +2313,12 @@ const notifyMonthlyRecap = async () => {
   }
 
   for (const row of targets) {
-    const employeeId = idByEmail.get(row.email.toLowerCase());
-    if (!employeeId) {
-      console.warn(`No employee_id for ${row.email}, skipping`);
+    const employee = employeeByEmail.get(row.email.toLowerCase());
+    if (!employee) {
+      console.warn(`No employee row for ${row.email}, skipping`);
       continue;
     }
+    const employeeId = employee.id;
     // Per-employee fetch wrapped: a single failure skips just this person.
     let projectRows: ProjectHoursPerDayRow[];
     try {
@@ -2249,7 +2357,18 @@ const notifyMonthlyRecap = async () => {
     const absenceDays = absenceWeekdaysByEmployee.get(employeeId) ?? 0;
     const toleratedByAbsence = absenceDays * STANDARD_WORKDAY_HOURS;
     const realMissing = Math.max(0, apiMissing - toleratedByAbsence);
-    const realMissingDays = Math.max(0, row.unregistered_days - absenceDays);
+    // unregistered_days isn't clamped to the employment window, so drop the
+    // workdays before a new hire started (or after a leaver's last day).
+    const notEmployedDays = unemployedWorkdays(
+      monthStart,
+      monthEnd,
+      employee,
+      holidays
+    );
+    const realMissingDays = Math.max(
+      0,
+      row.unregistered_days - absenceDays - notEmployedDays
+    );
 
     const targetUser = pickSlackRecipient(slackUsers, row.email);
     if (!targetUser) {
