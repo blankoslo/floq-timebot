@@ -1,4 +1,3 @@
-import fetch from "node-fetch";
 import { WebClient } from "@slack/web-api";
 import * as jwt from "jsonwebtoken";
 import moment from "moment";
