@@ -12,11 +12,10 @@
   },
   "dependencies": {
     "@slack/web-api": "^6.8.1",
-    "jsonwebtoken": "^9.0.0",
+    "google-auth-library": "^11.0.2",
     "moment": "^2.29.4"
   },
   "devDependencies": {
-    "@types/jsonwebtoken": "^9.0.1",
     "@types/node": "^22.20.1",
     "tsup": "^6.7.0",
     "typescript": "^5.0.2"

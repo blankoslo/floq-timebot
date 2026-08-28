@@ -1,9 +1,13 @@
 import { WebClient } from "@slack/web-api";
-import * as jwt from "jsonwebtoken";
+import { GoogleAuth } from "google-auth-library";
 import moment from "moment";
 
 // === Config ===
 const apiUri = process.env.API_URI || "https://api-test.floq.no";
+const floqAuthBaseUrl =
+  process.env.FLOQ_AUTH_BASE_URL || "https://test.floq.no";
+const floqServiceTokenAudience =
+  process.env.FLOQ_SERVICE_TOKEN_AUDIENCE || floqAuthBaseUrl;
 const slack = new WebClient(process.env.SLACK_API_TOKEN || "");
 const DRY_RUN = process.env.DRY_RUN === "true";
 const FLOQ_TIMESTAMP_URL =
@@ -129,8 +133,52 @@ type DayBreakdown = {
 };
 
 // === API helpers ===
-const apiToken = () =>
-  jwt.sign({ role: "read_only" }, process.env.API_JWT_SECRET || "dev-secret-shhh");
+const FLOQ_API_ROLE = "read_only";
+const TOKEN_EXPIRY_BUFFER_SECONDS = 60;
+
+const googleAuth = new GoogleAuth();
+let cachedApiToken: { accessToken: string; expiresAt: number } | null = null;
+
+async function apiToken(): Promise<string> {
+  if (cachedApiToken && cachedApiToken.expiresAt > Date.now()) {
+    return cachedApiToken.accessToken;
+  }
+
+  const idTokenClient = await googleAuth.getIdTokenClient(
+    floqServiceTokenAudience
+  );
+  const idToken = await idTokenClient.idTokenProvider.fetchIdToken(
+    floqServiceTokenAudience
+  );
+
+  const res = await fetch(`${floqAuthBaseUrl}/login/oauth/as/token`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({
+      grant_type: "urn:ietf:params:oauth:grant-type:token-exchange",
+      subject_token: idToken,
+      subject_token_type: "urn:ietf:params:oauth:token-type:id_token",
+      scope: FLOQ_API_ROLE,
+    }),
+  });
+  if (!res.ok) {
+    throw new Error(
+      `Floq token exchange failed: ${res.status} ${res.statusText} ${await res.text()}`
+    );
+  }
+  const { access_token, expires_in } = (await res.json()) as {
+    access_token: string;
+    expires_in: number;
+  };
+
+  cachedApiToken = {
+    accessToken: access_token,
+    expiresAt:
+      Date.now() +
+      Math.max(expires_in - TOKEN_EXPIRY_BUFFER_SECONDS, 0) * 1000,
+  };
+  return cachedApiToken.accessToken;
+}
 
 // Pick which Slack user to DM. Honors TEST_USER_SLACK_EMAIL override so we
 // can impersonate someone else's data while having the message land in our
@@ -147,7 +195,7 @@ async function apiGet<T>(path: string): Promise<T> {
   const res = await fetch(`${apiUri}${path}`, {
     method: "GET",
     headers: {
-      Authorization: `Bearer ${apiToken()}`,
+      Authorization: `Bearer ${await apiToken()}`,
       Accept: "application/json",
     },
   });
@@ -163,7 +211,7 @@ async function apiPost<T>(path: string, body: unknown): Promise<T> {
   const res = await fetch(`${apiUri}${path}`, {
     method: "POST",
     headers: {
-      Authorization: `Bearer ${apiToken()}`,
+      Authorization: `Bearer ${await apiToken()}`,
       Accept: "application/json",
       "Content-Type": "application/json",
     },
