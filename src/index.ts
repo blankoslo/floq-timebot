@@ -133,7 +133,7 @@ type DayBreakdown = {
 };
 
 // === API helpers ===
-const FLOQ_API_ROLE = "read_only";
+const FLOQ_API_SCOPE = "role:read_only";
 const TOKEN_EXPIRY_BUFFER_SECONDS = 60;
 
 const googleAuth = new GoogleAuth();
@@ -158,7 +158,7 @@ async function apiToken(): Promise<string> {
       grant_type: "urn:ietf:params:oauth:grant-type:token-exchange",
       subject_token: idToken,
       subject_token_type: "urn:ietf:params:oauth:token-type:id_token",
-      scope: FLOQ_API_ROLE,
+      scope: FLOQ_API_SCOPE,
     }),
   });
   if (!res.ok) {
