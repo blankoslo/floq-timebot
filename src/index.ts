@@ -1260,9 +1260,9 @@ const notifyInvoicingResponsible = async () => {
 // < 100 % booked has free capacity. Anyone with one or more such days in the
 // window shows up in the overview.
 //
-// Everything is fetched in bulk (4 calls total: employees, staffing, absence,
-// holidays) and the per-employee loop runs in memory — no per-employee API
-// round-trips.
+// Everything is fetched in bulk (5 calls total: employees, employment spans,
+// staffing, absence, holidays) and the per-employee loop runs in memory — no
+// per-employee API round-trips.
 
 type EmployeeInDatesRow = {
   employee_id: number;
@@ -1271,6 +1271,9 @@ type EmployeeInDatesRow = {
   role: string;
   image_url: string | null;
 };
+
+// Inclusive employment bounds as YYYY-MM-DD; null means unbounded on that side.
+type EmploymentSpan = { from: string | null; to: string | null };
 
 type StaffingRow = {
   employee: number;
@@ -1302,10 +1305,33 @@ async function fetchEmployeesInDates(
   startDate: string,
   endDate: string,
 ): Promise<EmployeeInDatesRow[]> {
-  // RPC returns active employees in the window (handles employment/termination
-  // dates) plus role — used for the overview labels.
+  // Careful: the RPC uses *overlap* semantics — `date_of_employment <=
+  // end_date AND (termination_date IS NULL OR termination_date >= start_date)`.
+  // Anyone employed for any part of the window is returned for the *whole*
+  // window, and the row carries no dates to clamp with. fetchEmploymentSpans
+  // supplies those so computeAvailability can drop the days outside each
+  // person's ansettelse. Role is used for the overview labels.
   return apiGet<EmployeeInDatesRow[]>(
     `/rpc/get_employees_in_dates?start_date=${startDate}&end_date=${endDate}`,
+  );
+}
+
+async function fetchEmploymentSpans(): Promise<Map<number, EmploymentSpan>> {
+  // Separate from fetchAllEmployees on purpose: EmployeeRow is shared with
+  // fetchEmployeeIdByEmail, which selects only `id`, so widening it would make
+  // the type lie for callers that never use the dates.
+  const rows = await apiGet<
+    {
+      id: number;
+      date_of_employment: string | null;
+      termination_date: string | null;
+    }[]
+  >("/employees?select=id,date_of_employment,termination_date");
+  return new Map(
+    rows.map((r) => [
+      r.id,
+      { from: r.date_of_employment, to: r.termination_date },
+    ]),
   );
 }
 
@@ -1329,6 +1355,7 @@ function computeAvailability(
   staffing: StaffingRow[],
   absences: AbsenceRow[],
   workdays: Array<{ date: string; isoWeek: number }>,
+  employmentSpans: Map<number, EmploymentSpan>,
 ): EmployeeAvailability[] {
   const bookedByEmpDate = new Map<string, number>();
   const addBooking = (empId: number, date: string, pct: number) => {
@@ -1342,10 +1369,33 @@ function computeAvailability(
     addBooking(a.employee_id, a.date, a.percentage ?? 100);
 
   const result: EmployeeAvailability[] = [];
+  let clampedCount = 0;
   for (const e of employees) {
     const perWeekMap = new Map<number, number>();
     let total = 0;
+    // Days outside the employment period aren't capacity. Staffing rows simply
+    // stop at termination, so without this a leaver who was booked 100 % right
+    // up to their last day reads as fully ledig afterwards — and a new hire
+    // reads as ledig before they start. Missing span → fail open (keep the
+    // person): the RPC already vouched they're employed in the window, and
+    // hiding a sellable consultant is worse than showing an extra row.
+    const span = employmentSpans.get(e.employee_id);
+    if (!span) {
+      console.warn(
+        `No employment span for employee ${e.employee_id} (${e.first_name} ${e.last_name}) — not clamping`,
+      );
+    }
+    let clamped = false;
     for (const wd of workdays) {
+      // Dates are fixed-width YYYY-MM-DD, so string order is date order.
+      if (span?.from && wd.date < span.from) {
+        clamped = true;
+        continue;
+      }
+      if (span?.to && wd.date > span.to) {
+        clamped = true;
+        continue;
+      }
       const booked =
         bookedByEmpDate.get(bookingKey(e.employee_id, wd.date)) ?? 0;
       // Strictly less than 100 % booked → there's capacity to sell that day.
@@ -1354,6 +1404,7 @@ function computeAvailability(
         perWeekMap.set(wd.isoWeek, (perWeekMap.get(wd.isoWeek) ?? 0) + 1);
       }
     }
+    if (clamped) clampedCount += 1;
     if (total === 0) continue;
     const perWeek = Array.from(perWeekMap.entries())
       .sort((a, b) => a[0] - b[0])
@@ -1372,6 +1423,9 @@ function computeAvailability(
       roleRank(a.role) - roleRank(b.role) ||
       b.totalFreeDays - a.totalFreeDays ||
       a.name.localeCompare(b.name, "nb"),
+  );
+  console.info(
+    `${clampedCount} employee(s) had days removed by the employment-span clamp`,
   );
   return result;
 }
@@ -1468,16 +1522,22 @@ const notifyAvailableConsultants = async () => {
   );
 
   let employees: EmployeeInDatesRow[];
+  let employmentSpans: Map<number, EmploymentSpan>;
   let staffing: StaffingRow[];
   let absences: AbsenceRow[];
   let holidays: HolidayRow[];
   try {
-    [employees, staffing, absences, holidays] = await Promise.all([
-      fetchEmployeesInDates(startStr, endStr),
-      fetchStaffingForRange(startStr, endStr),
-      fetchAllAbsencesForWeek(startStr, endStr),
-      fetchHolidays(startStr, endStr),
-    ]);
+    // The spans ride along in the same try/catch on purpose: falling back to
+    // unclamped days would quietly republish the exact wrong data this clamp
+    // exists to remove, to a sales channel.
+    [employees, employmentSpans, staffing, absences, holidays] =
+      await Promise.all([
+        fetchEmployeesInDates(startStr, endStr),
+        fetchEmploymentSpans(),
+        fetchStaffingForRange(startStr, endStr),
+        fetchAllAbsencesForWeek(startStr, endStr),
+        fetchHolidays(startStr, endStr),
+      ]);
   } catch (err) {
     console.error("availability fetch failed:", err);
     return;
@@ -1501,7 +1561,13 @@ const notifyAvailableConsultants = async () => {
   }
   const isoWeeks = Array.from(isoWeeksSet).sort((a, b) => a - b);
 
-  const people = computeAvailability(employees, staffing, absences, workdays);
+  const people = computeAvailability(
+    employees,
+    staffing,
+    absences,
+    workdays,
+    employmentSpans,
+  );
 
   const { text, blocks } = buildAvailabilityMessage(
     weekStart,
