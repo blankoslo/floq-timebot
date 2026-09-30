@@ -36,6 +36,24 @@ const CAPACITY_WEEKS_AHEAD = Number(process.env.CAPACITY_WEEKS_AHEAD || "6");
 
 moment.locale("nb");
 
+// === Mocked "today" ===
+// MOCK_TODAY=YYYY-MM-DD pins every flow's idea of the current date, so the
+// date-gated ones (invoicing send-day, first-of-month, first Monday) can be
+// exercised on any calendar day instead of waiting for it to come round.
+// Strict parsing: a typo must fail loudly at boot, not silently fall back to
+// the real date and send a wrong month to everyone.
+const MOCK_TODAY = process.env.MOCK_TODAY?.trim();
+if (MOCK_TODAY && !moment(MOCK_TODAY, "YYYY-MM-DD", true).isValid()) {
+  throw new Error(
+    `MOCK_TODAY must be a valid YYYY-MM-DD date, got "${MOCK_TODAY}"`,
+  );
+}
+// Every "what is now" read goes through this — never call moment() bare, or
+// that call site silently ignores MOCK_TODAY. Returns a fresh instance each
+// time because moment objects are mutable and callers chain .subtract() etc.
+const now = (): moment.Moment =>
+  MOCK_TODAY ? moment(MOCK_TODAY, "YYYY-MM-DD", true) : moment();
+
 // Bonus is now computed entirely in the database via the
 // fg_bonus_employee_monthly RPC (blankoslo/floq-db). It handles per-week FG,
 // the majority-week-in-month rule, the non-FG-code adjustment, and the
@@ -260,13 +278,13 @@ const invoicingReminderForce = process.env.INVOICING_REMINDER_FORCE === "true";
 // previous-month" week has finished, so bonus + FG are stable. No separate
 // cron needed. IS_MONTHLY_RECAP=true forces it for local testing.
 const isMonthlyRecap =
-  process.env.IS_MONTHLY_RECAP === "true" || (isMonday && moment().date() <= 7);
+  process.env.IS_MONTHLY_RECAP === "true" || (isMonday && now().date() <= 7);
 
 // Previous calendar week (Mon–Sun before today). Used by both the Monday
 // digest and the Tuesday follow-up — both report on the just-finished week.
 const getLastFullWeekRange = () => ({
-  startDate: moment().subtract(1, "week").startOf("isoWeek"),
-  endDate: moment().subtract(1, "week").endOf("isoWeek"),
+  startDate: now().subtract(1, "week").startOf("isoWeek"),
+  endDate: now().subtract(1, "week").endOf("isoWeek"),
 });
 
 // === Data fetching ===
@@ -1119,7 +1137,7 @@ function buildInvoicingReminderMessage(
 }
 
 const notifyInvoicingResponsible = async () => {
-  const today = moment().startOf("day");
+  const today = now().startOf("day");
 
   // Two send-days get evaluated below — this month's, and next month's for the
   // "next" log line — and each rolls forward through holidays, so fetch both
@@ -1505,7 +1523,7 @@ function buildAvailabilityMessage(
 }
 
 const notifyAvailableConsultants = async () => {
-  const today = moment().startOf("day");
+  const today = now().startOf("day");
   // Window: Monday of the current ISO week through the end of the N-th week.
   const weekStart = today.clone().startOf("isoWeek");
   const windowEnd = weekStart
@@ -1674,7 +1692,7 @@ function lastWeekShortfallPeriod(): ShortfallPeriod {
 }
 
 function lastMonthShortfallPeriod(): ShortfallPeriod {
-  const startDate = moment().subtract(1, "month").startOf("month");
+  const startDate = now().subtract(1, "month").startOf("month");
   const endDate = startDate.clone().endOf("month");
   return {
     startDate,
@@ -2242,7 +2260,7 @@ function buildMonthlyRecapMessage(params: {
 
 const notifyMonthlyRecap = async () => {
   // Previous calendar month — e.g. on June 1 covers May 1 → May 31.
-  const monthStart = moment().subtract(1, "month").startOf("month");
+  const monthStart = now().subtract(1, "month").startOf("month");
   const monthEnd = monthStart.clone().endOf("month");
   const startStr = monthStart.format("YYYY-MM-DD");
   const endStr = monthEnd.format("YYYY-MM-DD");
@@ -2467,7 +2485,7 @@ const main = async () => {
     // On those days the 1st-of-month cron sends a month-wide nag which
     // covers the whole month (last week included), so the per-week nag
     // is a strict subset and would just duplicate the message.
-    const todayIsFirstOfMonth = moment().date() === 1;
+    const todayIsFirstOfMonth = now().date() === 1;
     if (todayIsFirstOfMonth) {
       console.info(
         "Skipping Tuesday nag — today is also 1st of month, monthly nag covers it.",
@@ -2482,7 +2500,7 @@ const main = async () => {
     // shortfall paragraph for anyone with missing hours. Without this
     // check, those people would get the same "mangler X t for {måned}"
     // info twice (~once a year, when 1st falls on a Monday).
-    const todayIsFirstMonday = moment().day() === 1 && moment().date() <= 7;
+    const todayIsFirstMonday = now().day() === 1 && now().date() <= 7;
     if (todayIsFirstMonday) {
       console.info(
         "Skipping first-of-month nag — today is also first Monday, monthly recap covers it.",
