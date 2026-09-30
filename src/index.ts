@@ -36,6 +36,24 @@ const CAPACITY_WEEKS_AHEAD = Number(process.env.CAPACITY_WEEKS_AHEAD || "6");
 
 moment.locale("nb");
 
+// === Mocked "today" ===
+// MOCK_TODAY=YYYY-MM-DD pins every flow's idea of the current date, so the
+// date-gated ones (invoicing send-day, first-of-month, first Monday) can be
+// exercised on any calendar day instead of waiting for it to come round.
+// Strict parsing: a typo must fail loudly at boot, not silently fall back to
+// the real date and send a wrong month to everyone.
+const MOCK_TODAY = process.env.MOCK_TODAY?.trim();
+if (MOCK_TODAY && !moment(MOCK_TODAY, "YYYY-MM-DD", true).isValid()) {
+  throw new Error(
+    `MOCK_TODAY must be a valid YYYY-MM-DD date, got "${MOCK_TODAY}"`,
+  );
+}
+// Every "what is now" read goes through this — never call moment() bare, or
+// that call site silently ignores MOCK_TODAY. Returns a fresh instance each
+// time because moment objects are mutable and callers chain .subtract() etc.
+const now = (): moment.Moment =>
+  MOCK_TODAY ? moment(MOCK_TODAY, "YYYY-MM-DD", true) : moment();
+
 // Bonus is now computed entirely in the database via the
 // fg_bonus_employee_monthly RPC (blankoslo/floq-db). It handles per-week FG,
 // the majority-week-in-month rule, the non-FG-code adjustment, and the
@@ -260,13 +278,13 @@ const invoicingReminderForce = process.env.INVOICING_REMINDER_FORCE === "true";
 // previous-month" week has finished, so bonus + FG are stable. No separate
 // cron needed. IS_MONTHLY_RECAP=true forces it for local testing.
 const isMonthlyRecap =
-  process.env.IS_MONTHLY_RECAP === "true" || (isMonday && moment().date() <= 7);
+  process.env.IS_MONTHLY_RECAP === "true" || (isMonday && now().date() <= 7);
 
 // Previous calendar week (Mon–Sun before today). Used by both the Monday
 // digest and the Tuesday follow-up — both report on the just-finished week.
 const getLastFullWeekRange = () => ({
-  startDate: moment().subtract(1, "week").startOf("isoWeek"),
-  endDate: moment().subtract(1, "week").endOf("isoWeek"),
+  startDate: now().subtract(1, "week").startOf("isoWeek"),
+  endDate: now().subtract(1, "week").endOf("isoWeek"),
 });
 
 // === Data fetching ===
@@ -1067,16 +1085,17 @@ const notifyAdminAboutOvertime = async () => {
 // === Reminder til oppdragsansvarlig: fakturering ===
 //
 // DM every project's oppdragsansvarlig (projects.responsible) to invoice the
-// just-finished month. Send-day: the month's last day if it's a virkedag, else
-// rolled forward to the next virkedag (past weekends and holidays).
+// just-finished month. Send-day: the first day of the following month if it's a
+// virkedag, else rolled forward to the next virkedag (past weekends and
+// holidays). The reminder always covers the month before the send-day.
 
-// Last day of monthAnchor's month, rolled forward to the first virkedag on or
+// First day of monthAnchor's month, rolled forward to the first virkedag on or
 // after it (isoWeekday 6/7 = Sat/Sun).
 function invoicingReminderSendDate(
   monthAnchor: moment.Moment,
   holidaySet: Set<string>,
 ): moment.Moment {
-  const d = monthAnchor.clone().endOf("month").startOf("day");
+  const d = monthAnchor.clone().startOf("month");
   while (d.isoWeekday() >= 6 || holidaySet.has(d.format("YYYY-MM-DD"))) {
     d.add(1, "day");
   }
@@ -1118,48 +1137,45 @@ function buildInvoicingReminderMessage(
 }
 
 const notifyInvoicingResponsible = async () => {
-  const today = moment().startOf("day");
+  const today = now().startOf("day");
 
-  // Covers both roll windows: last month's start through past this month's end.
-  const holStart = today
-    .clone()
-    .subtract(1, "month")
-    .startOf("month")
-    .format("YYYY-MM-DD");
+  // Two send-days get evaluated below — this month's, and next month's for the
+  // "next" log line — and each rolls forward through holidays, so fetch both
+  // months whole rather than guessing how far a roll can travel.
+  const holStart = today.clone().startOf("month").format("YYYY-MM-DD");
   const holEnd = today
     .clone()
+    .startOf("month")
+    .add(1, "month")
     .endOf("month")
-    .add(10, "days")
     .format("YYYY-MM-DD");
 
   const holidays = await fetchHolidays(holStart, holEnd);
   const holidaySet = new Set(holidays.map((h) => h.date));
 
-  // A forward roll from a weekend/holiday month-end lands in the next month, so
-  // today's send-day may belong to this month (case A) or last month (case B).
-  let coveredMonth: moment.Moment;
+  // The send-day sits at the start of the month, so whenever we do send, it's
+  // for the month that just ended — the gate below decides whether, not which.
+  const monthLabel = today
+    .clone()
+    .startOf("month")
+    .subtract(1, "month")
+    .format("MMMM YYYY");
+
   if (invoicingReminderForce) {
-    coveredMonth = today.clone().subtract(1, "month");
-    console.info("INVOICING_REMINDER_FORCE — covering previous month.");
+    console.info("INVOICING_REMINDER_FORCE — bypassing the send-day gate.");
   } else {
-    const thisMonthSend = invoicingReminderSendDate(today, holidaySet);
-    const prevMonthSend = invoicingReminderSendDate(
-      today.clone().subtract(1, "month"),
-      holidaySet,
-    );
-    if (today.isSame(thisMonthSend, "day")) {
-      coveredMonth = today.clone();
-    } else if (today.isSame(prevMonthSend, "day")) {
-      coveredMonth = today.clone().subtract(1, "month");
-    } else {
-      const next = thisMonthSend.isAfter(today) ? thisMonthSend : prevMonthSend;
+    const sendDate = invoicingReminderSendDate(today, holidaySet);
+    if (!today.isSame(sendDate, "day")) {
+      // Past this month's send-day, the next one comes off next month's 1st.
+      const next = sendDate.isAfter(today)
+        ? sendDate
+        : invoicingReminderSendDate(today.clone().add(1, "month"), holidaySet);
       console.info(
         `Not an invoicing reminder day (today=${today.format("YYYY-MM-DD")}, next=${next.format("YYYY-MM-DD")}). Skipping.`,
       );
       return;
     }
   }
-  const monthLabel = coveredMonth.format("MMMM YYYY");
 
   console.info(`Invoicing reminder for ${monthLabel}`);
 
@@ -1507,7 +1523,7 @@ function buildAvailabilityMessage(
 }
 
 const notifyAvailableConsultants = async () => {
-  const today = moment().startOf("day");
+  const today = now().startOf("day");
   // Window: Monday of the current ISO week through the end of the N-th week.
   const weekStart = today.clone().startOf("isoWeek");
   const windowEnd = weekStart
@@ -1676,7 +1692,7 @@ function lastWeekShortfallPeriod(): ShortfallPeriod {
 }
 
 function lastMonthShortfallPeriod(): ShortfallPeriod {
-  const startDate = moment().subtract(1, "month").startOf("month");
+  const startDate = now().subtract(1, "month").startOf("month");
   const endDate = startDate.clone().endOf("month");
   return {
     startDate,
@@ -2244,7 +2260,7 @@ function buildMonthlyRecapMessage(params: {
 
 const notifyMonthlyRecap = async () => {
   // Previous calendar month — e.g. on June 1 covers May 1 → May 31.
-  const monthStart = moment().subtract(1, "month").startOf("month");
+  const monthStart = now().subtract(1, "month").startOf("month");
   const monthEnd = monthStart.clone().endOf("month");
   const startStr = monthStart.format("YYYY-MM-DD");
   const endStr = monthEnd.format("YYYY-MM-DD");
@@ -2469,7 +2485,7 @@ const main = async () => {
     // On those days the 1st-of-month cron sends a month-wide nag which
     // covers the whole month (last week included), so the per-week nag
     // is a strict subset and would just duplicate the message.
-    const todayIsFirstOfMonth = moment().date() === 1;
+    const todayIsFirstOfMonth = now().date() === 1;
     if (todayIsFirstOfMonth) {
       console.info(
         "Skipping Tuesday nag — today is also 1st of month, monthly nag covers it.",
@@ -2484,7 +2500,7 @@ const main = async () => {
     // shortfall paragraph for anyone with missing hours. Without this
     // check, those people would get the same "mangler X t for {måned}"
     // info twice (~once a year, when 1st falls on a Monday).
-    const todayIsFirstMonday = moment().day() === 1 && moment().date() <= 7;
+    const todayIsFirstMonday = now().day() === 1 && now().date() <= 7;
     if (todayIsFirstMonday) {
       console.info(
         "Skipping first-of-month nag — today is also first Monday, monthly recap covers it.",

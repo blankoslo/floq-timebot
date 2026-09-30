@@ -7,16 +7,16 @@ The bot runs a set of independent flows, each gated by its own `IS_*` env flag.
 A scheduler trigger sets exactly the flags it wants — there is no hidden
 bundling, so every flow can be triggered and tested on its own.
 
-| Flag | Flow | Recipient |
-| ---- | ---- | --------- |
-| `IS_MONDAY` | Weekly digest of last week's hours per person | DM to each employee |
-| `IS_TUESDAY` | Follow-up nudge to people still missing hours for last week | DM to stragglers |
-| `IS_FIRST_OF_MONTH` | Month nudge to people still missing hours for last month | DM to stragglers |
-| `IS_MONTHLY_RECAP` | Monthly recap (FG, bonus, project hours). Derived: fires on the first Monday of the month | DM to each employee |
-| `IS_OVERTIME` | Unpaid registered overtime exists | `#overtid` channel |
-| `IS_INVOICING_REMINDER` | Month-end reminder to invoice. Internal date gate fires it on the last virkedag of the month (rolled forward past weekends/holidays) | DM to each project's oppdragsansvarlig |
-| `IS_AVAILABILITY` | Free capacity (unstaffed days) the next N weeks, per person | capacity channel |
-| `IS_ADMIN_MISSING` | Aggregated table of who is missing time entries | capacity channel |
+| Flag                    | Flow                                                                                                                                                          | Recipient                              |
+| ----------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------- | -------------------------------------- |
+| `IS_MONDAY`             | Weekly digest of last week's hours per person                                                                                                                 | DM to each employee                    |
+| `IS_TUESDAY`            | Follow-up nudge to people still missing hours for last week                                                                                                   | DM to stragglers                       |
+| `IS_FIRST_OF_MONTH`     | Month nudge to people still missing hours for last month                                                                                                      | DM to stragglers                       |
+| `IS_MONTHLY_RECAP`      | Monthly recap (FG, bonus, project hours). Derived: fires on the first Monday of the month                                                                     | DM to each employee                    |
+| `IS_OVERTIME`           | Unpaid registered overtime exists                                                                                                                             | `#overtid` channel                     |
+| `IS_INVOICING_REMINDER` | Reminder to invoice the month just finished. Internal date gate fires it on the first virkedag of the following month (rolled forward past weekends/holidays) | DM to each project's oppdragsansvarlig |
+| `IS_AVAILABILITY`       | Free capacity (unstaffed days) the next N weeks, per person                                                                                                   | capacity channel                       |
+| `IS_ADMIN_MISSING`      | Aggregated table of who is missing time entries                                                                                                               | capacity channel                       |
 
 The capacity channel defaults to `#admin-bemanningogsalg-diskusjon`.
 
@@ -42,12 +42,16 @@ The bot authenticates to Floq as the `floq-prod-timebot` service account. Anyone
 test environment (`api-test.floq.no`) without deploying first:
 
     gcloud auth application-default login --impersonate-service-account=floq-prod-timebot@marine-cycle-97212.iam.gserviceaccount.com
-    DRY_RUN=true IS_AVAILABILITY=true node dist/index.js
+
+And then running
+
+    SLACK_API_TOKEN=$SLACK_API_TOKEN DRY_RUN=true IS_AVAILABILITY=true node dist/index.js
 
 `API_URI` and `FLOQ_AUTH_BASE_URL` already default to the test environment, so no
-further env vars are needed for a local run. `SLACK_API_TOKEN` still points at the
-real Slack workspace — `DRY_RUN=true` logs the rendered preview instead of sending
-it, so this is safe even without setting `TEST_USER_EMAIL`/`TEST_USER_SLACK_EMAIL`.
+further env vars are needed for a local run. Remember to set `SLACK_API_TOKEN` in
+the`.env`-file. It still points at the real Slack workspace, but `DRY_RUN=true` logs
+the rendered preview instead of sending it, so this is safe _even_ without setting
+`TEST_USER_EMAIL`/`TEST_USER_SLACK_EMAIL`.
 
 This impersonation changes your machine-wide Application Default Credentials —
 every local tool that resolves ADC will act as `floq-prod-timebot` until you log
@@ -68,31 +72,58 @@ end-to-end:
 
 When testing there are some environment variables available for easier testing:
 
-| Environment Variable | Description                               | Default Value |
-| -------------------- | ----------------------------------------- | ------------- |
-| `DRY_RUN`            | If set to true, no notifications are sent (preview is logged instead) | `false` |
-| `IS_MONDAY`          | Run the weekly digest                     | `false`       |
-| `IS_TUESDAY`         | Run the Tuesday follow-up nudge           | `false`       |
-| `IS_FIRST_OF_MONTH`  | Run the first-of-month nudge              | `false`       |
-| `IS_MONTHLY_RECAP`   | Force the monthly recap                   | `false`       |
-| `IS_OVERTIME`        | Run the unpaid-overtime check             | `false`       |
-| `IS_INVOICING_REMINDER` | Run the month-end invoicing reminder (still self-gates to the send-day) | `false`  |
-| `INVOICING_REMINDER_FORCE` | Bypass the invoicing send-day gate (targets the previous month) — for testing | `false` |
-| `IS_AVAILABILITY`    | Run the free-capacity overview            | `false`       |
-| `IS_ADMIN_MISSING`   | Run the aggregated missing-time table     | `false`       |
+| Environment Variable       | Description                                                                   | Default Value     |
+| -------------------------- | ----------------------------------------------------------------------------- | ----------------- |
+| `DRY_RUN`                  | If set to true, no notifications are sent (preview is logged instead)         | `false`           |
+| `MOCK_TODAY`               | Pin the current date (`YYYY-MM-DD`) for every flow — see below                | unset (real date) |
+| `IS_MONDAY`                | Run the weekly digest                                                         | `false`           |
+| `IS_TUESDAY`               | Run the Tuesday follow-up nudge                                               | `false`           |
+| `IS_FIRST_OF_MONTH`        | Run the first-of-month nudge                                                  | `false`           |
+| `IS_MONTHLY_RECAP`         | Force the monthly recap                                                       | `false`           |
+| `IS_OVERTIME`              | Run the unpaid-overtime check                                                 | `false`           |
+| `IS_INVOICING_REMINDER`    | Run the invoicing reminder (still self-gates to the send-day)                 | `false`           |
+| `INVOICING_REMINDER_FORCE` | Bypass the invoicing send-day gate (targets the previous month) — for testing | `false`           |
+| `IS_AVAILABILITY`          | Run the free-capacity overview                                                | `false`           |
+| `IS_ADMIN_MISSING`         | Run the aggregated missing-time table                                         | `false`           |
 
 Flags are read from `process.env` only — the bot does not load a `.env` file.
 To run locally, set them inline (`IS_AVAILABILITY=true DRY_RUN=true node
 dist/index.js`) or export them into your shell.
 
+## Mocking the date
+
+Several flows are date-gated and only do anything on one specific day — the
+invoicing reminder (first virkedag of the month), the monthly recap (first
+Monday), the first-of-month nudge. `MOCK_TODAY` pins what the bot thinks today
+is, so you can test those without waiting for the calendar:
+
+    MOCK_TODAY=2026-08-03 IS_INVOICING_REMINDER=true DRY_RUN=true node dist/index.js
+    # → Invoicing reminder for juli 2026
+
+    MOCK_TODAY=2026-08-04 IS_INVOICING_REMINDER=true DRY_RUN=true node dist/index.js
+    # → Not an invoicing reminder day (today=2026-08-04, next=2026-09-01). Skipping.
+
+It applies to _every_ flow at once, since all of them read the date through the
+same `now()` helper — so a mocked run of the Monday digest also reports on the
+week before the mocked date, not the real one. Holidays are still fetched live
+from the API, so a mocked date rolls past real holidays (`MOCK_TODAY=2026-05-04`
+sends for april 2026, because 1 May fell on a Friday).
+
+An unparseable value throws at startup rather than quietly falling back to the
+real date — a silent fallback would mean sending the wrong month to everyone.
+Pair it with `DRY_RUN=true` unless you specifically want the messages to land.
+
+**Never set `MOCK_TODAY` in production.** It is a local/testing knob only;
+leaving it set would freeze the bot on one date indefinitely.
+
 Configuration knobs (all have sensible defaults):
 
-| Environment Variable | Description | Default Value |
-| -------------------- | ----------- | ------------- |
-| `CAPACITY_CHANNEL` | Channel for the availability and admin-missing overviews | `admin-bemanningogsalg-diskusjon` |
-| `CAPACITY_WEEKS_AHEAD` | How many ISO weeks ahead the availability overview covers | `6` |
-| `ADMIN_MISSING_PERIOD` | Period for `IS_ADMIN_MISSING`: `week` (last week) or `month` (last month) | `week` |
-| `FLOQ_INVOICE_URL` | Link in the invoicing reminder | `https://inni.blank.no/invoice` |
+| Environment Variable   | Description                                                               | Default Value                     |
+| ---------------------- | ------------------------------------------------------------------------- | --------------------------------- |
+| `CAPACITY_CHANNEL`     | Channel for the availability and admin-missing overviews                  | `admin-bemanningogsalg-diskusjon` |
+| `CAPACITY_WEEKS_AHEAD` | How many ISO weeks ahead the availability overview covers                 | `6`                               |
+| `ADMIN_MISSING_PERIOD` | Period for `IS_ADMIN_MISSING`: `week` (last week) or `month` (last month) | `week`                            |
+| `FLOQ_INVOICE_URL`     | Link in the invoicing reminder                                            | `https://inni.blank.no/invoice`   |
 
 Scheduling note: `IS_ADMIN_MISSING` is independent of the personal-nudge flags.
 To mirror the nudge cadence, set `IS_ADMIN_MISSING=true` on the Monday and
@@ -101,10 +132,22 @@ the first-of-month trigger.
 
 Scheduling note for `IS_INVOICING_REMINDER`: schedule a trigger that fires it
 **every weekday** with `IS_INVOICING_REMINDER=true`. The flow self-gates — it
-only sends on the month's last virkedag, rolled forward past weekends and
-holidays (so if the last day is a Saturday it lands the following Monday). Every
-other weekday it exits after one cheap holidays lookup. Firing it monthly would
-be wrong: the exact send date shifts month to month, so a fixed cron can't hit
-it.
+only sends on the first virkedag of the month, rolled forward past weekends and
+holidays (so if the 1st is a Saturday it lands the following Monday), and the
+reminder always covers the month that just ended. Every other weekday it exits
+after one cheap holidays lookup.
+
+Two things gate this: the trigger decides whether the process runs, the flow
+decides whether it sends. Both have to say yes, which is why a monthly cron on
+the 1st would be wrong — not because the date is merely off, but because when
+the two disagree the month is **silently lost**. A trigger on Sat 1 Aug 2026
+starts the container, the gate computes Mon 3 Aug, logs `Skipping.` and returns,
+and nothing fires again until 1 Sep. July's reminder is never sent. That happens
+in ~42 % of months (any 1st on a weekend, plus 1 Jan and 1 May).
+
+A `1-7` window (`0 8 1-7 * *`) is the honest minimum — the longest roll is +3
+days, so seven fires a month always contains the send-day, with the flow
+no-opping on the other six. Every weekday is just extra margin that needs no
+revisiting if the holiday rules change.
 
 For reverting back to previous versions after testing, delete the latest image from the [Container Registry](https://console.cloud.google.com/gcr/images/marine-cycle-97212/global/github.com/blankoslo/floq-timebot?authuser=1&tab=info) or change the latest tag.
