@@ -14,7 +14,7 @@ bundling, so every flow can be triggered and tested on its own.
 | `IS_FIRST_OF_MONTH` | Month nudge to people still missing hours for last month | DM to stragglers |
 | `IS_MONTHLY_RECAP` | Monthly recap (FG, bonus, project hours). Derived: fires on the first Monday of the month | DM to each employee |
 | `IS_OVERTIME` | Unpaid registered overtime exists | `#overtid` channel |
-| `IS_INVOICING_REMINDER` | Month-end reminder to invoice. Internal date gate fires it on the last virkedag of the month (rolled forward past weekends/holidays) | DM to each project's oppdragsansvarlig |
+| `IS_INVOICING_REMINDER` | Reminder to invoice the month just finished. Internal date gate fires it on the first virkedag of the following month (rolled forward past weekends/holidays) | DM to each project's oppdragsansvarlig |
 | `IS_AVAILABILITY` | Free capacity (unstaffed days) the next N weeks, per person | capacity channel |
 | `IS_ADMIN_MISSING` | Aggregated table of who is missing time entries | capacity channel |
 
@@ -76,7 +76,7 @@ When testing there are some environment variables available for easier testing:
 | `IS_FIRST_OF_MONTH`  | Run the first-of-month nudge              | `false`       |
 | `IS_MONTHLY_RECAP`   | Force the monthly recap                   | `false`       |
 | `IS_OVERTIME`        | Run the unpaid-overtime check             | `false`       |
-| `IS_INVOICING_REMINDER` | Run the month-end invoicing reminder (still self-gates to the send-day) | `false`  |
+| `IS_INVOICING_REMINDER` | Run the invoicing reminder (still self-gates to the send-day) | `false`  |
 | `INVOICING_REMINDER_FORCE` | Bypass the invoicing send-day gate (targets the previous month) — for testing | `false` |
 | `IS_AVAILABILITY`    | Run the free-capacity overview            | `false`       |
 | `IS_ADMIN_MISSING`   | Run the aggregated missing-time table     | `false`       |
@@ -101,10 +101,22 @@ the first-of-month trigger.
 
 Scheduling note for `IS_INVOICING_REMINDER`: schedule a trigger that fires it
 **every weekday** with `IS_INVOICING_REMINDER=true`. The flow self-gates — it
-only sends on the month's last virkedag, rolled forward past weekends and
-holidays (so if the last day is a Saturday it lands the following Monday). Every
-other weekday it exits after one cheap holidays lookup. Firing it monthly would
-be wrong: the exact send date shifts month to month, so a fixed cron can't hit
-it.
+only sends on the first virkedag of the month, rolled forward past weekends and
+holidays (so if the 1st is a Saturday it lands the following Monday), and the
+reminder always covers the month that just ended. Every other weekday it exits
+after one cheap holidays lookup.
+
+Two things gate this: the trigger decides whether the process runs, the flow
+decides whether it sends. Both have to say yes, which is why a monthly cron on
+the 1st would be wrong — not because the date is merely off, but because when
+the two disagree the month is **silently lost**. A trigger on Sat 1 Aug 2026
+starts the container, the gate computes Mon 3 Aug, logs `Skipping.` and returns,
+and nothing fires again until 1 Sep. July's reminder is never sent. That happens
+in ~42 % of months (any 1st on a weekend, plus 1 Jan and 1 May).
+
+A `1-7` window (`0 8 1-7 * *`) is the honest minimum — the longest roll is +3
+days, so seven fires a month always contains the send-day, with the flow
+no-opping on the other six. Every weekday is just extra margin that needs no
+revisiting if the holiday rules change.
 
 For reverting back to previous versions after testing, delete the latest image from the [Container Registry](https://console.cloud.google.com/gcr/images/marine-cycle-97212/global/github.com/blankoslo/floq-timebot?authuser=1&tab=info) or change the latest tag.

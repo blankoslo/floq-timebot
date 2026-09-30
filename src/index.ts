@@ -1067,16 +1067,17 @@ const notifyAdminAboutOvertime = async () => {
 // === Reminder til oppdragsansvarlig: fakturering ===
 //
 // DM every project's oppdragsansvarlig (projects.responsible) to invoice the
-// just-finished month. Send-day: the month's last day if it's a virkedag, else
-// rolled forward to the next virkedag (past weekends and holidays).
+// just-finished month. Send-day: the first day of the following month if it's a
+// virkedag, else rolled forward to the next virkedag (past weekends and
+// holidays). The reminder always covers the month before the send-day.
 
-// Last day of monthAnchor's month, rolled forward to the first virkedag on or
+// First day of monthAnchor's month, rolled forward to the first virkedag on or
 // after it (isoWeekday 6/7 = Sat/Sun).
 function invoicingReminderSendDate(
   monthAnchor: moment.Moment,
   holidaySet: Set<string>,
 ): moment.Moment {
-  const d = monthAnchor.clone().endOf("month").startOf("day");
+  const d = monthAnchor.clone().startOf("month");
   while (d.isoWeekday() >= 6 || holidaySet.has(d.format("YYYY-MM-DD"))) {
     d.add(1, "day");
   }
@@ -1120,46 +1121,43 @@ function buildInvoicingReminderMessage(
 const notifyInvoicingResponsible = async () => {
   const today = moment().startOf("day");
 
-  // Covers both roll windows: last month's start through past this month's end.
-  const holStart = today
-    .clone()
-    .subtract(1, "month")
-    .startOf("month")
-    .format("YYYY-MM-DD");
+  // Two send-days get evaluated below — this month's, and next month's for the
+  // "next" log line — and each rolls forward through holidays, so fetch both
+  // months whole rather than guessing how far a roll can travel.
+  const holStart = today.clone().startOf("month").format("YYYY-MM-DD");
   const holEnd = today
     .clone()
+    .startOf("month")
+    .add(1, "month")
     .endOf("month")
-    .add(10, "days")
     .format("YYYY-MM-DD");
 
   const holidays = await fetchHolidays(holStart, holEnd);
   const holidaySet = new Set(holidays.map((h) => h.date));
 
-  // A forward roll from a weekend/holiday month-end lands in the next month, so
-  // today's send-day may belong to this month (case A) or last month (case B).
-  let coveredMonth: moment.Moment;
+  // The send-day sits at the start of the month, so whenever we do send, it's
+  // for the month that just ended — the gate below decides whether, not which.
+  const monthLabel = today
+    .clone()
+    .startOf("month")
+    .subtract(1, "month")
+    .format("MMMM YYYY");
+
   if (invoicingReminderForce) {
-    coveredMonth = today.clone().subtract(1, "month");
-    console.info("INVOICING_REMINDER_FORCE — covering previous month.");
+    console.info("INVOICING_REMINDER_FORCE — bypassing the send-day gate.");
   } else {
-    const thisMonthSend = invoicingReminderSendDate(today, holidaySet);
-    const prevMonthSend = invoicingReminderSendDate(
-      today.clone().subtract(1, "month"),
-      holidaySet,
-    );
-    if (today.isSame(thisMonthSend, "day")) {
-      coveredMonth = today.clone();
-    } else if (today.isSame(prevMonthSend, "day")) {
-      coveredMonth = today.clone().subtract(1, "month");
-    } else {
-      const next = thisMonthSend.isAfter(today) ? thisMonthSend : prevMonthSend;
+    const sendDate = invoicingReminderSendDate(today, holidaySet);
+    if (!today.isSame(sendDate, "day")) {
+      // Past this month's send-day, the next one comes off next month's 1st.
+      const next = sendDate.isAfter(today)
+        ? sendDate
+        : invoicingReminderSendDate(today.clone().add(1, "month"), holidaySet);
       console.info(
         `Not an invoicing reminder day (today=${today.format("YYYY-MM-DD")}, next=${next.format("YYYY-MM-DD")}). Skipping.`,
       );
       return;
     }
   }
-  const monthLabel = coveredMonth.format("MMMM YYYY");
 
   console.info(`Invoicing reminder for ${monthLabel}`);
 
