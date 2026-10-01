@@ -43,9 +43,13 @@ test environment (`api-test.floq.no`) without deploying first:
 
     gcloud auth application-default login --impersonate-service-account=floq-prod-timebot@marine-cycle-97212.iam.gserviceaccount.com
 
-And then running
+and
 
-    SLACK_API_TOKEN=$SLACK_API_TOKEN DRY_RUN=true IS_AVAILABILITY=true node dist/index.js
+    run build && source .env
+
+and then finally
+
+    SLACK_API_TOKEN=$SLACK_API_TOKEN DRY_RUN=true node dist/index.js
 
 `API_URI` and `FLOQ_AUTH_BASE_URL` already default to the test environment, so no
 further env vars are needed for a local run. Remember to set `SLACK_API_TOKEN` in
