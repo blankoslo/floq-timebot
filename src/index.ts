@@ -3,7 +3,8 @@ import { GoogleAuth } from "google-auth-library";
 import moment from "moment";
 
 // === Config ===
-const apiUri = process.env.API_URI || "https://api-test.floq.no";
+const platformUri =
+  process.env.PLATFORM_URI || "https://api-test.platform.floq.no";
 const floqAuthBaseUrl =
   process.env.FLOQ_AUTH_BASE_URL || "https://test.floq.no";
 const floqServiceTokenAudience =
@@ -54,10 +55,9 @@ if (MOCK_TODAY && !moment(MOCK_TODAY, "YYYY-MM-DD", true).isValid()) {
 const now = (): moment.Moment =>
   MOCK_TODAY ? moment(MOCK_TODAY, "YYYY-MM-DD", true) : moment();
 
-// Bonus is now computed entirely in the database via the
-// fg_bonus_employee_monthly RPC (blankoslo/floq-db). It handles per-week FG,
-// the majority-week-in-month rule, the non-FG-code adjustment, and the
-// Fagleder bonus tiers — so the bot no longer mirrors any of that logic.
+// Bonus comes from floq-platform's billing-degree report, which owns
+// per-week FG, the majority-week-in-month rule, the non-FG-code adjustment
+// and the Fagleder bonus tiers — so the bot mirrors none of that logic.
 
 // Note: we used to hardcode an absence-code list here, but it was both
 // incomplete (missed several codes Floq counts as unavailable) and wrong
@@ -69,68 +69,48 @@ const now = (): moment.Moment =>
 type TimeTrackingStatusRow = {
   name: string;
   email: string;
-  available_hours: number;
-  billable_hours: number;
-  non_billable_hours: number;
-  unavailable_hours: number;
-  unregistered_days: number;
-  last_date: string | null;
-  last_created: string | null;
+  availableHours: number;
+  billableHours: number;
+  nonBillableHours: number;
+  unregisteredDays: number;
+  lastDate: string | null;
 };
 
-type EmployeeRow = { id: number; email: string };
-type HolidayRow = { date: string; name: string };
+type EmployeeRow = {
+  id: number;
+  email: string;
+  firstName: string;
+  lastName: string;
+  role: string | null;
+  dateOfEmployment: string | null;
+  terminationDate: string | null;
+};
+type HolidayRow = { date: string; name: string | null };
 type AbsenceRow = {
   date: string;
-  employee_id: number;
+  employeeId: number;
   reason: string;
-  // Defaults to 100 in the DB. Present on /absence rows; older callers that
-  // only read date/employee_id are unaffected.
-  percentage?: number;
+  percentage: number;
 };
-
-// "Bekreft avspasering" for a week with negative balance. minutes is the signed balance
-type WeekBalanceConfirmationRow = {
-  employee: number;
-  week_start: string; // YYYY-MM-DD, always ISO Monday
-  minutes: number;
-  confirmed: boolean;
-};
-type ProjectRow = {
-  id: string;
-  name: string;
-  // From floq: "billable" | "non_billable" | "unavailable" (verified via API)
-  billable: string;
-};
-// `responsible` (oppdragsansvarlig) is an employees.id — nullable in the DB,
-// but the fetcher filters out null rows.
 type InvoiceProjectRow = {
   id: string;
   name: string;
+  // oppdragsansvarlig, an employees.id
   responsible: number;
 };
-type FGPeriodRow = {
-  employee_id: number;
-  available_hours: number;
-  billable_hours: number;
-  fg_rate: number;
+type BillingDegreePeriodRow = {
+  employeeId: number;
+  billableHours: number;
+  capacityHours: number;
 };
-type MonthlyBonusRow = {
-  employee_id: number;
-  month_start: string;
-  month_end: string;
-  bonus_available_hours: number;
-  billable_hours: number;
-  fg_bonus_rate: number;
-  bonus: number; // kr, already computed
-};
-// entries_sums_for_employee_with_project view: project name + hours already
-// aggregated per (work_date, project). Use this instead of /time_entry,
-// which is event-based (multiple rows per change → naive sums overcount).
+// One row per (employee, project, day) with hours; days without are no row.
 type ProjectHoursPerDayRow = {
-  work_date: string;
-  employee_id: number;
-  project: string;
+  employeeId: number;
+  projectId: string;
+  projectName: string;
+  // "billable" | "nonbillable" | "unavailable"
+  status: string;
+  date: string;
   hours: number;
 };
 
@@ -215,38 +195,30 @@ function pickSlackRecipient(
   );
 }
 
-async function apiGet<T>(path: string): Promise<T> {
-  const res = await fetch(`${apiUri}${path}`, {
-    method: "GET",
+async function apiFetch(path: string, body?: unknown): Promise<Response> {
+  const method = body === undefined ? "GET" : "POST";
+  const res = await fetch(`${platformUri}${path}`, {
+    method,
     headers: {
       Authorization: `Bearer ${await apiToken()}`,
-      Accept: "application/json",
+      ...(body === undefined ? {} : { "Content-Type": "application/json" }),
     },
+    body: body === undefined ? undefined : JSON.stringify(body),
   });
   if (!res.ok) {
     throw new Error(
-      `GET ${path} failed: ${res.status} ${res.statusText} ${await res.text()}`,
+      `${method} ${path} failed: ${res.status} ${res.statusText} ${await res.text()}`,
     );
   }
-  return res.json() as Promise<T>;
+  return res;
+}
+
+async function apiGet<T>(path: string): Promise<T> {
+  return (await apiFetch(path)).json() as Promise<T>;
 }
 
 async function apiPost<T>(path: string, body: unknown): Promise<T> {
-  const res = await fetch(`${apiUri}${path}`, {
-    method: "POST",
-    headers: {
-      Authorization: `Bearer ${await apiToken()}`,
-      Accept: "application/json",
-      "Content-Type": "application/json",
-    },
-    body: JSON.stringify(body),
-  });
-  if (!res.ok) {
-    throw new Error(
-      `POST ${path} failed: ${res.status} ${res.statusText} ${await res.text()}`,
-    );
-  }
-  return res.json() as Promise<T>;
+  return (await apiFetch(path, body)).json() as Promise<T>;
 }
 
 // === Schedule flags ===
@@ -293,42 +265,22 @@ async function fetchTimeTrackingStatus(
   startDate: moment.Moment,
   endDate: moment.Moment,
 ): Promise<TimeTrackingStatusRow[]> {
-  return apiPost<TimeTrackingStatusRow[]>("/rpc/time_tracking_status", {
-    start_date: startDate.format("YYYY-MM-DD"),
-    end_date: endDate.format("YYYY-MM-DD"),
-  });
-}
-
-async function fetchEmployeeIdByEmail(email: string): Promise<number | null> {
-  // Throws on a real API error (caller's loop skips the employee). Returns
-  // null only when the employee genuinely isn't found.
-  const rows = await apiGet<EmployeeRow[]>(
-    `/employees?select=id&email=eq.${encodeURIComponent(email)}`,
+  return apiGet<TimeTrackingStatusRow[]>(
+    `/reports/time-tracking-status?from=${startDate.format("YYYY-MM-DD")}&to=${endDate.format("YYYY-MM-DD")}`,
   );
-  return rows[0]?.id ?? null;
 }
 
 // Bulk fetchers below intentionally do NOT catch — a failed shared fetch
 // must abort the whole run (the error propagates to main's allSettled and
 // no messages go out) rather than silently degrade every message.
 
-async function fetchProjectInfoMap(): Promise<Map<string, ProjectRow>> {
-  // The view returns project IDs (e.g. "AID1000"); fetch human-readable
-  // names and the billable category so we can split work vs absence in
-  // the project breakdown.
-  const projects = await apiGet<ProjectRow[]>(
-    "/projects?select=id,name,billable",
-  );
-  return new Map(projects.map((p) => [p.id, p]));
-}
-
 async function fetchHolidays(
   startDate: string,
   endDate: string,
 ): Promise<HolidayRow[]> {
-  return apiGet<HolidayRow[]>(
-    `/holidays?date=gte.${startDate}&date=lte.${endDate}`,
-  );
+  // The platform only serves the whole table.
+  const holidays = await apiGet<HolidayRow[]>("/timesheet/holidays");
+  return holidays.filter((h) => h.date >= startDate && h.date <= endDate);
 }
 
 async function fetchAllAbsencesForWeek(
@@ -336,74 +288,112 @@ async function fetchAllAbsencesForWeek(
   endDate: string,
 ): Promise<AbsenceRow[]> {
   return apiGet<AbsenceRow[]>(
-    `/absence?date=gte.${startDate}&date=lte.${endDate}`,
+    `/timesheet/absence?from=${startDate}&to=${endDate}`,
   );
 }
 
 async function fetchAllEmployees(): Promise<EmployeeRow[]> {
-  return apiGet<EmployeeRow[]>("/employees?select=id,email");
+  return apiGet<EmployeeRow[]>("/employees");
 }
 
-async function fetchWeekBalanceConfirmationsInRange(
+// employee id → week_start → hours of avspasering confirmed for that week.
+// confirmed-weeks only answers which confirmations still hold (the week's
+// balance hasn't slipped below what was confirmed); the minutes live on the
+// confirmation itself. Those are the signed week balance, so only a negative
+// value is a shortfall the user has owned up to.
+async function fetchConfirmedShortfalls(
+  employeeIds: number[],
   fromMonday: string,
   toDate: string,
-): Promise<WeekBalanceConfirmationRow[]> {
-  return apiGet<WeekBalanceConfirmationRow[]>(
-    `/week_balance_confirmations?select=employee,week_start,minutes,confirmed` +
-      `&week_start=gte.${fromMonday}&week_start=lte.${toDate}&confirmed=is.true`,
+): Promise<Map<number, Map<string, number>>> {
+  const result = new Map<number, Map<string, number>>();
+  // An empty employeeIds is an empty answer, not everyone's.
+  if (employeeIds.length === 0) return result;
+
+  const weeks = await apiGet<{ employeeId: number; weekStart: string }[]>(
+    `/timesheet/confirmed-weeks?employeeIds=${employeeIds.join(",")}&from=${fromMonday}&to=${toDate}`,
   );
+  const confirmations = await Promise.all(
+    weeks.map(async (w) => {
+      const res = await apiFetch(
+        `/timesheet/balance-confirmation?employeeId=${w.employeeId}&weekStart=${w.weekStart}`,
+      );
+      // 204 = never confirmed. Can't follow a confirmed-weeks hit unless it
+      // was withdrawn in between.
+      if (res.status === 204) return null;
+      const { minutes } = (await res.json()) as { minutes: number };
+      return { ...w, minutes };
+    }),
+  );
+
+  for (const c of confirmations) {
+    if (!c || c.minutes >= 0) continue;
+    const byWeek = result.get(c.employeeId) ?? new Map<string, number>();
+    byWeek.set(c.weekStart, -c.minutes / 60);
+    result.set(c.employeeId, byWeek);
+  }
+  return result;
 }
 
 async function fetchActiveBillableProjectsWithResponsible(): Promise<
   InvoiceProjectRow[]
 > {
-  return apiGet<InvoiceProjectRow[]>(
-    "/projects?select=id,name,responsible&active=eq.true&billable=eq.billable&responsible=not.is.null",
+  const projects = await apiGet<
+    { id: string; name: string; responsible: number | null }[]
+  >("/projects?active=true&billable=true");
+  return projects.filter((p): p is InvoiceProjectRow => p.responsible !== null);
+}
+
+async function fetchHoursByEmployee(
+  employeeIds: number[],
+  startDate: string,
+  endDate: string,
+): Promise<Map<number, ProjectHoursPerDayRow[]>> {
+  const byEmployee = new Map<number, ProjectHoursPerDayRow[]>();
+  // The route refuses an empty list rather than answering nobody.
+  if (employeeIds.length === 0) return byEmployee;
+
+  const rows = await apiPost<ProjectHoursPerDayRow[]>(
+    "/reports/employee-hours",
+    { employeeIds, from: startDate, to: endDate },
+  );
+  for (const r of rows) {
+    const list = byEmployee.get(r.employeeId);
+    if (list) list.push(r);
+    else byEmployee.set(r.employeeId, [r]);
+  }
+  return byEmployee;
+}
+
+// FG over exactly start..end, as fg_employee_period gave it. The per-employee
+// report's month bucket is not a substitute: it follows the majority-week rule
+// the bonus uses, so its hours don't add up to the calendar month.
+async function fetchAllFGForRange(
+  start: string,
+  end: string,
+): Promise<Map<number, { billable: number; available: number }>> {
+  const { employees } = await apiGet<{ employees: BillingDegreePeriodRow[] }>(
+    `/reports/billing-degree/achieved/period?from=${start}&to=${end}`,
+  );
+  return new Map(
+    employees.map((e) => [
+      e.employeeId,
+      { billable: e.billableHours, available: e.capacityHours },
+    ]),
   );
 }
 
 // Per-employee fetcher: throws on a real API error. Callers wrap the loop
 // body so one employee's failure skips just them (loud), not the whole run.
-async function fetchProjectHoursPerDay(
+// No route serves every employee's bonus at once.
+async function fetchMonthlyBonus(
   employeeId: number,
-  startDate: string,
-  endDate: string,
-): Promise<ProjectHoursPerDayRow[]> {
-  // Note: RPC parameters are `from_date`/`to_date`, NOT start_date/end_date
-  // (verified via PostgREST hint when called with wrong names).
-  return apiGet<ProjectHoursPerDayRow[]>(
-    `/rpc/entries_sums_for_employee_with_project?employee_id=${employeeId}&from_date=${startDate}&to_date=${endDate}`,
+  month: string, // YYYY-MM
+): Promise<number> {
+  const { months } = await apiGet<{ months: { bonusAmount: number }[] }>(
+    `/reports/billing-degree/achieved/employee?employeeId=${employeeId}&fromMonth=${month}&toMonth=${month}`,
   );
-}
-
-async function fetchAllFGForRange(
-  start: string,
-  end: string,
-): Promise<Map<number, { billable: number; available: number }>> {
-  // emp_id optional — omit it to get every employee's FG for the period in
-  // one call. (fg_employee_period from blankoslo/floq-db PR 91.)
-  const rows = await apiGet<FGPeriodRow[]>(
-    `/rpc/fg_employee_period?from_date=${start}&to_date=${end}`,
-  );
-  return new Map(
-    rows.map((r) => [
-      r.employee_id,
-      { billable: r.billable_hours, available: r.available_hours },
-    ]),
-  );
-}
-
-async function fetchAllMonthlyBonuses(
-  year: number,
-  month: number, // 1–12
-): Promise<Map<number, number>> {
-  // emp_id is optional — omitting it returns every employee's bonus in one
-  // call. The DB does everything: per-week FG with bonus_hours_for_employee,
-  // majority-week-in-month assignment, and the Fagleder bonus tiers.
-  const rows = await apiGet<MonthlyBonusRow[]>(
-    `/rpc/fg_bonus_employee_monthly?year=${year}&month=${month}`,
-  );
-  return new Map(rows.map((r) => [r.employee_id, r.bonus]));
+  return months[0]?.bonusAmount ?? 0;
 }
 
 // === Per-day breakdown ===
@@ -433,10 +423,10 @@ function excusedAbsenceByEmployee(
     if (!EXCUSED_ABSENCE_REASONS.has(a.reason)) continue;
     const day = moment(a.date).day();
     if (day < 1 || day > 5) continue;
-    const cur = result.get(a.employee_id) ?? { days: 0, dates: new Set() };
-    cur.days += (a.percentage ?? 100) / 100;
+    const cur = result.get(a.employeeId) ?? { days: 0, dates: new Set() };
+    cur.days += a.percentage / 100;
     cur.dates.add(a.date);
-    result.set(a.employee_id, cur);
+    result.set(a.employeeId, cur);
   }
   return result;
 }
@@ -450,7 +440,6 @@ function buildPerDayBreakdown(
   endDate: moment.Moment,
   rows: ProjectHoursPerDayRow[],
   holidays: HolidayRow[],
-  projectInfo: Map<string, ProjectRow>,
 ): DayBreakdown[] {
   // Aggregate per date: absence entries and work entries both count toward
   // "registered time" so e.g. 6 t Permisjon u/lønn shows as ⚠️ partial
@@ -459,36 +448,31 @@ function buildPerDayBreakdown(
     totalHours: number;
     workHours: number;
     absenceHours: number;
-    projectCodes: string[]; // ordered, deduped — resolved to names below
+    projects: Map<string, string>; // id → name, in first-seen order
   };
   const byDate = new Map<string, DayAgg>();
   for (const r of rows) {
-    let cur = byDate.get(r.work_date);
+    let cur = byDate.get(r.date);
     if (!cur) {
       cur = {
         totalHours: 0,
         workHours: 0,
         absenceHours: 0,
-        projectCodes: [],
+        projects: new Map(),
       };
-      byDate.set(r.work_date, cur);
+      byDate.set(r.date, cur);
     }
     cur.totalHours += r.hours;
-    // The view's `project` field is the project ID (code) e.g. "AID1000",
-    // "FER1000". A day counts as absence only if the project's billable
-    // field says "unavailable" — Permisjon m/lønn is "non_billable"
-    // (i.e. work), not absence.
-    const billable = projectInfo.get(r.project)?.billable;
-    if (billable === "unavailable") {
+    // A day counts as absence only if the project's status is
+    // "unavailable" — Permisjon m/lønn is "nonbillable" (i.e. work).
+    if (r.status === "unavailable") {
       cur.absenceHours += r.hours;
     } else {
       cur.workHours += r.hours;
     }
     // Skip zero-hour entries (UI markers, e.g. "Ferie marked but not
-    // registered") and dedupe by code per day.
-    if (r.hours > 0 && !cur.projectCodes.includes(r.project)) {
-      cur.projectCodes.push(r.project);
-    }
+    // registered").
+    if (r.hours > 0) cur.projects.set(r.projectId, r.projectName);
   }
 
   const holidayByDate = new Map(holidays.map((h) => [h.date, h.name]));
@@ -508,7 +492,8 @@ function buildPerDayBreakdown(
     const agg = byDate.get(ds);
     const totalHours = agg?.totalHours ?? 0;
     const workHours = agg?.workHours ?? 0;
-    const holidayName = holidayByDate.get(ds);
+    const isHoliday = holidayByDate.has(ds);
+    const holidayName = holidayByDate.get(ds) ?? undefined;
     const weekend = isWeekend(d);
 
     let status: DayStatus;
@@ -519,7 +504,7 @@ function buildPerDayBreakdown(
       // get filtered out rather than surfacing as a row.
       status = "weekend";
       hoursExpected = 0;
-    } else if (holidayName) {
+    } else if (isHoliday) {
       status = "holiday";
       hoursExpected = 0;
     } else {
@@ -536,9 +521,7 @@ function buildPerDayBreakdown(
       }
     }
 
-    const projects = agg
-      ? agg.projectCodes.map((code) => projectInfo.get(code)?.name ?? code)
-      : [];
+    const projects = agg ? Array.from(agg.projects.values()) : [];
     result.push({
       date: ds,
       status,
@@ -896,9 +879,9 @@ const notifySlackers = async () => {
 
   // We notify everyone who is expected to work this week — including those
   // who are fully registered (they get the brief variant). People on full-
-  // week vacation/parental leave (available_hours = 0) get nothing.
-  let targets = rows.filter((r) => r.available_hours > 0);
-  console.info(`${targets.length} employees with available_hours > 0`);
+  // week vacation/parental leave (availableHours = 0) get nothing.
+  let targets = rows.filter((r) => r.availableHours > 0);
+  console.info(`${targets.length} employees with availableHours > 0`);
 
   if (TEST_USER_EMAIL) {
     const before = targets.length;
@@ -920,13 +903,11 @@ const notifySlackers = async () => {
   }
 
   // Fetch shared data once
-  const [holidays, projectInfo, slackUsersResp, confirmedByEmployee] =
-    await Promise.all([
-      fetchHolidays(startStr, endStr),
-      fetchProjectInfoMap(),
-      slack.users.list(),
-      fetchConfirmedShortfallHours(startDate, endDate),
-    ]);
+  const [holidays, slackUsersResp, allEmployees] = await Promise.all([
+    fetchHolidays(startStr, endStr),
+    slack.users.list(),
+    fetchAllEmployees(),
+  ]);
 
   const slackUsers = slackUsersResp.members;
   if (!slackUsers) {
@@ -934,29 +915,26 @@ const notifySlackers = async () => {
     return;
   }
 
+  const idByEmail = new Map(
+    allEmployees.map((e) => [e.email.toLowerCase(), e.id]),
+  );
+  const targetIds = targetEmployeeIds(targets, idByEmail);
+  const [confirmedByEmployee, hoursByEmployee] = await Promise.all([
+    fetchConfirmedShortfallHours(targetIds, startDate, endDate),
+    fetchHoursByEmployee(targetIds, startStr, endStr),
+  ]);
+
   for (const row of targets) {
-    // Per-employee fetches are wrapped so one person's API failure skips
-    // just them (loud) rather than sending a wrong message or aborting the
-    // whole run.
-    let employeeId: number | null;
-    let projectRows: ProjectHoursPerDayRow[];
-    try {
-      employeeId = await fetchEmployeeIdByEmail(row.email);
-      if (!employeeId) {
-        console.warn(`No employee_id for ${row.email}, skipping`);
-        continue;
-      }
-      projectRows = await fetchProjectHoursPerDay(employeeId, startStr, endStr);
-    } catch (err) {
-      console.error(`Skipping ${row.email} — fetch failed:`, err);
+    const employeeId = idByEmail.get(row.email.toLowerCase());
+    if (!employeeId) {
+      console.warn(`No employee_id for ${row.email}, skipping`);
       continue;
     }
     const days = buildPerDayBreakdown(
       startDate,
       endDate,
-      projectRows,
+      hoursByEmployee.get(employeeId) ?? [],
       holidays,
-      projectInfo,
     );
 
     // Headline totals sum across all surviving days. The filter inside
@@ -1036,11 +1014,14 @@ const notifySlackers = async () => {
 const notifyAdminAboutOvertime = async () => {
   const channelName = "overtid";
 
-  let entries: any[];
+  let entries: { paidDate: string | null }[];
   try {
-    entries = await apiGet<any[]>(`/paid_overtime?paid_date=is.null`);
+    const all = await apiGet<{ paidDate: string | null }[]>(
+      "/timesheet/overtime",
+    );
+    entries = all.filter((e) => e.paidDate === null);
   } catch (err) {
-    console.error("Failed to fetch paid_overtime:", err);
+    console.error("Failed to fetch overtime:", err);
     return;
   }
 
@@ -1267,23 +1248,12 @@ const notifyInvoicingResponsible = async () => {
 // < 100 % booked has free capacity. Anyone with one or more such days in the
 // window shows up in the overview.
 //
-// Everything is fetched in bulk (5 calls total: employees, employment spans,
-// staffing, absence, holidays) and the per-employee loop runs in memory — no
+// Everything is fetched in bulk (4 calls total: employees, staffing, absence,
+// holidays) and the per-employee loop runs in memory — no
 // per-employee API round-trips.
 
-type EmployeeInDatesRow = {
-  employee_id: number;
-  first_name: string;
-  last_name: string;
-  role: string;
-  image_url: string | null;
-};
-
-// Inclusive employment bounds as YYYY-MM-DD; null means unbounded on that side.
-type EmploymentSpan = { from: string | null; to: string | null };
-
 type StaffingRow = {
-  employee: number;
+  employeeId: number;
   date: string; // YYYY-MM-DD
   percentage: number;
 };
@@ -1308,37 +1278,20 @@ function roleRank(role: string): number {
   return i === -1 ? ROLE_ORDER.length : i;
 }
 
-async function fetchEmployeesInDates(
+// Overlap semantics, as floq-db's get_employees_in_dates had them: anyone
+// employed for any part of the window. computeAvailability then drops the
+// days outside each person's ansettelse. No hire date means not (yet)
+// employed, as the RPC's `date_of_employment <= end_date` read it.
+function employedInWindow(
+  employees: EmployeeRow[],
   startDate: string,
   endDate: string,
-): Promise<EmployeeInDatesRow[]> {
-  // Careful: the RPC uses *overlap* semantics — `date_of_employment <=
-  // end_date AND (termination_date IS NULL OR termination_date >= start_date)`.
-  // Anyone employed for any part of the window is returned for the *whole*
-  // window, and the row carries no dates to clamp with. fetchEmploymentSpans
-  // supplies those so computeAvailability can drop the days outside each
-  // person's ansettelse. Role is used for the overview labels.
-  return apiGet<EmployeeInDatesRow[]>(
-    `/rpc/get_employees_in_dates?start_date=${startDate}&end_date=${endDate}`,
-  );
-}
-
-async function fetchEmploymentSpans(): Promise<Map<number, EmploymentSpan>> {
-  // Separate from fetchAllEmployees on purpose: EmployeeRow is shared with
-  // fetchEmployeeIdByEmail, which selects only `id`, so widening it would make
-  // the type lie for callers that never use the dates.
-  const rows = await apiGet<
-    {
-      id: number;
-      date_of_employment: string | null;
-      termination_date: string | null;
-    }[]
-  >("/employees?select=id,date_of_employment,termination_date");
-  return new Map(
-    rows.map((r) => [
-      r.id,
-      { from: r.date_of_employment, to: r.termination_date },
-    ]),
+): EmployeeRow[] {
+  return employees.filter(
+    (e) =>
+      e.dateOfEmployment !== null &&
+      e.dateOfEmployment <= endDate &&
+      (e.terminationDate === null || e.terminationDate >= startDate),
   );
 }
 
@@ -1347,7 +1300,7 @@ async function fetchStaffingForRange(
   endDate: string,
 ): Promise<StaffingRow[]> {
   return apiGet<StaffingRow[]>(
-    `/staffing?date=gte.${startDate}&date=lte.${endDate}&select=employee,date,percentage`,
+    `/staffing/days?from=${startDate}&to=${endDate}`,
   );
 }
 
@@ -1358,22 +1311,18 @@ function bookingKey(employeeId: number, date: string): string {
 }
 
 function computeAvailability(
-  employees: EmployeeInDatesRow[],
+  employees: EmployeeRow[],
   staffing: StaffingRow[],
   absences: AbsenceRow[],
   workdays: Array<{ date: string; isoWeek: number }>,
-  employmentSpans: Map<number, EmploymentSpan>,
 ): EmployeeAvailability[] {
   const bookedByEmpDate = new Map<string, number>();
   const addBooking = (empId: number, date: string, pct: number) => {
     const k = bookingKey(empId, date);
     bookedByEmpDate.set(k, (bookedByEmpDate.get(k) ?? 0) + pct);
   };
-  for (const s of staffing) addBooking(s.employee, s.date, s.percentage ?? 0);
-  // absence.percentage defaults to 100 in the DB; treat a missing value as a
-  // full day off rather than 0.
-  for (const a of absences)
-    addBooking(a.employee_id, a.date, a.percentage ?? 100);
+  for (const s of staffing) addBooking(s.employeeId, s.date, s.percentage);
+  for (const a of absences) addBooking(a.employeeId, a.date, a.percentage);
 
   const result: EmployeeAvailability[] = [];
   let clampedCount = 0;
@@ -1383,28 +1332,19 @@ function computeAvailability(
     // Days outside the employment period aren't capacity. Staffing rows simply
     // stop at termination, so without this a leaver who was booked 100 % right
     // up to their last day reads as fully ledig afterwards — and a new hire
-    // reads as ledig before they start. Missing span → fail open (keep the
-    // person): the RPC already vouched they're employed in the window, and
-    // hiding a sellable consultant is worse than showing an extra row.
-    const span = employmentSpans.get(e.employee_id);
-    if (!span) {
-      console.warn(
-        `No employment span for employee ${e.employee_id} (${e.first_name} ${e.last_name}) — not clamping`,
-      );
-    }
+    // reads as ledig before they start.
     let clamped = false;
     for (const wd of workdays) {
       // Dates are fixed-width YYYY-MM-DD, so string order is date order.
-      if (span?.from && wd.date < span.from) {
+      if (e.dateOfEmployment && wd.date < e.dateOfEmployment) {
         clamped = true;
         continue;
       }
-      if (span?.to && wd.date > span.to) {
+      if (e.terminationDate && wd.date > e.terminationDate) {
         clamped = true;
         continue;
       }
-      const booked =
-        bookedByEmpDate.get(bookingKey(e.employee_id, wd.date)) ?? 0;
+      const booked = bookedByEmpDate.get(bookingKey(e.id, wd.date)) ?? 0;
       // Strictly less than 100 % booked → there's capacity to sell that day.
       if (booked < 100 - 1e-9) {
         total += 1;
@@ -1417,8 +1357,8 @@ function computeAvailability(
       .sort((a, b) => a[0] - b[0])
       .map(([isoWeek, freeDays]) => ({ isoWeek, freeDays }));
     result.push({
-      name: `${e.first_name} ${e.last_name}`,
-      role: e.role,
+      name: `${e.firstName} ${e.lastName}`,
+      role: e.role ?? "",
       totalFreeDays: total,
       perWeek,
     });
@@ -1528,23 +1468,17 @@ const notifyAvailableConsultants = async () => {
     `Availability overview ${startStr} → ${endStr} (${CAPACITY_WEEKS_AHEAD} weeks)`,
   );
 
-  let employees: EmployeeInDatesRow[];
-  let employmentSpans: Map<number, EmploymentSpan>;
+  let employees: EmployeeRow[];
   let staffing: StaffingRow[];
   let absences: AbsenceRow[];
   let holidays: HolidayRow[];
   try {
-    // The spans ride along in the same try/catch on purpose: falling back to
-    // unclamped days would quietly republish the exact wrong data this clamp
-    // exists to remove, to a sales channel.
-    [employees, employmentSpans, staffing, absences, holidays] =
-      await Promise.all([
-        fetchEmployeesInDates(startStr, endStr),
-        fetchEmploymentSpans(),
-        fetchStaffingForRange(startStr, endStr),
-        fetchAllAbsencesForWeek(startStr, endStr),
-        fetchHolidays(startStr, endStr),
-      ]);
+    [employees, staffing, absences, holidays] = await Promise.all([
+      fetchAllEmployees(),
+      fetchStaffingForRange(startStr, endStr),
+      fetchAllAbsencesForWeek(startStr, endStr),
+      fetchHolidays(startStr, endStr),
+    ]);
   } catch (err) {
     console.error("availability fetch failed:", err);
     return;
@@ -1569,11 +1503,10 @@ const notifyAvailableConsultants = async () => {
   const isoWeeks = Array.from(isoWeeksSet).sort((a, b) => a - b);
 
   const people = computeAvailability(
-    employees,
+    employedInWindow(employees, startStr, endStr),
     staffing,
     absences,
     workdays,
-    employmentSpans,
   );
 
   const { text, blocks } = buildAvailabilityMessage(
@@ -1616,7 +1549,7 @@ function buildLateRegisterMessage(
   const hoursLabel = `*${formatHoursShort(missingHours)} time${missingHours === 1 ? "" : "r"}*`;
   const daysLabel = missingDays === 1 ? "*1 dag*" : `*${missingDays} dager*`;
 
-  // The day count comes from the API's unregistered_days, which only counts
+  // The day count comes from the API's unregisteredDays, which only counts
   // fully empty workdays. At 0 the gap sits in partial days, more likely
   // avspasering than forgotten timeføring, so ask for a confirmation instead
   // (and skip the "fordelt på N dager" clause, which would read "0 dager").
@@ -1687,39 +1620,50 @@ function lastMonthShortfallPeriod(): ShortfallPeriod {
   };
 }
 
-// employee_id → hours of avspasering confirmed within the period. Stored
-// minutes are the signed week balance, so only a negative value is a
-// shortfall the user has owned up to; a week in surplus contributes nothing.
-// Floq stores one balance per week, so a week straddling the period's edge
-// (a month starting mid-week) counts by the share of its Mon–Fri inside it.
+// employee id → hours of avspasering confirmed within the period. Floq stores
+// one balance per week, so a week straddling the period's edge (a month
+// starting mid-week) counts by the share of its Mon–Fri inside it.
 function confirmedShortfallHours(
-  rows: WeekBalanceConfirmationRow[],
+  shortfalls: Map<number, Map<string, number>>,
   startDate: moment.Moment,
   endDate: moment.Moment,
 ): Map<number, number> {
   const byEmployee = new Map<number, number>();
-  for (const row of rows) {
-    if (row.minutes >= 0) continue;
-    let weekdaysInPeriod = 0;
-    for (let i = 0; i < 5; i++) {
-      const day = moment(row.week_start).add(i, "days");
-      if (day.isBetween(startDate, endDate, "day", "[]")) weekdaysInPeriod++;
+  for (const [employeeId, byWeek] of shortfalls) {
+    for (const [weekStart, weekHours] of byWeek) {
+      let weekdaysInPeriod = 0;
+      for (let i = 0; i < 5; i++) {
+        const day = moment(weekStart).add(i, "days");
+        if (day.isBetween(startDate, endDate, "day", "[]")) weekdaysInPeriod++;
+      }
+      const hours = weekHours * (weekdaysInPeriod / 5);
+      byEmployee.set(employeeId, (byEmployee.get(employeeId) ?? 0) + hours);
     }
-    const hours = (-row.minutes / 60) * (weekdaysInPeriod / 5);
-    byEmployee.set(row.employee, (byEmployee.get(row.employee) ?? 0) + hours);
   }
   return byEmployee;
 }
 
+function targetEmployeeIds(
+  rows: TimeTrackingStatusRow[],
+  idByEmail: Map<string, number>,
+): number[] {
+  return rows.flatMap((r): number[] => {
+    const id = idByEmail.get(r.email.toLowerCase());
+    return id === undefined ? [] : [id];
+  });
+}
+
 async function fetchConfirmedShortfallHours(
+  employeeIds: number[],
   startDate: moment.Moment,
   endDate: moment.Moment,
 ): Promise<Map<number, number>> {
-  const rows = await fetchWeekBalanceConfirmationsInRange(
+  const shortfalls = await fetchConfirmedShortfalls(
+    employeeIds,
     startDate.clone().startOf("isoWeek").format("YYYY-MM-DD"),
     endDate.format("YYYY-MM-DD"),
   );
-  return confirmedShortfallHours(rows, startDate, endDate);
+  return confirmedShortfallHours(shortfalls, startDate, endDate);
 }
 
 const notifyLateRegisterers = async (period: ShortfallPeriod) => {
@@ -1743,11 +1687,11 @@ const notifyLateRegisterers = async (period: ShortfallPeriod) => {
 
   // Only nag the ones who *still* have a shortfall after Monday's reminder.
   let targets = rows.filter((r) => {
-    if (r.available_hours <= 0) return false;
-    const registered = r.billable_hours + r.non_billable_hours;
-    return registered < r.available_hours - REPORT_TOLERANCE_HOURS;
+    if (r.availableHours <= 0) return false;
+    const registered = r.billableHours + r.nonBillableHours;
+    return registered < r.availableHours - REPORT_TOLERANCE_HOURS;
   });
-  console.info(`${targets.length} still below available_hours`);
+  console.info(`${targets.length} still below availableHours`);
 
   if (TEST_USER_EMAIL) {
     const before = targets.length;
@@ -1784,13 +1728,14 @@ const notifyLateRegisterers = async (period: ShortfallPeriod) => {
   const excusedAbsence = excusedAbsenceByEmployee(allAbsences);
 
   const confirmedByEmployee = await fetchConfirmedShortfallHours(
+    targetEmployeeIds(targets, idByEmail),
     period.startDate,
     period.endDate,
   );
 
   for (const row of targets) {
     const apiMissing =
-      row.available_hours - row.billable_hours - row.non_billable_hours;
+      row.availableHours - row.billableHours - row.nonBillableHours;
 
     const employeeId = idByEmail.get(row.email.toLowerCase());
     const excusedDays = employeeId ? excusedAbsence.get(employeeId) : undefined;
@@ -1811,7 +1756,7 @@ const notifyLateRegisterers = async (period: ShortfallPeriod) => {
     const missingHours = apiMissing - toleratedByAbsence;
     const missingDays = Math.max(
       0,
-      row.unregistered_days - (excusedDays?.dates.size ?? 0),
+      row.unregisteredDays - (excusedDays?.dates.size ?? 0),
     );
 
     // The user has already owned up to this week as avspasering, so don't nag
@@ -1870,7 +1815,7 @@ const notifyLateRegisterers = async (period: ShortfallPeriod) => {
 // the Monday/Tuesday/first-of-month triggers as an admin's-eye companion to the
 // personal DMs.
 //
-// Honours week_balance_confirmations on the same terms as the personal nudge.
+// Honours confirmed avspasering on the same terms as the personal nudge.
 
 type MissingTimeRow = {
   name: string;
@@ -1960,26 +1905,30 @@ const notifyAdminMissingTime = async (period: ShortfallPeriod) => {
 
   // Only those who owed time this period (registered < available).
   const candidates = rows.filter((r) => {
-    if (r.available_hours <= 0) return false;
-    const registered = r.billable_hours + r.non_billable_hours;
-    return registered < r.available_hours - REPORT_TOLERANCE_HOURS;
+    if (r.availableHours <= 0) return false;
+    const registered = r.billableHours + r.nonBillableHours;
+    return registered < r.availableHours - REPORT_TOLERANCE_HOURS;
   });
 
   // Excused days in the absence calendar explain part of a gap.
-  const [allAbsences, allEmployees, confirmedByEmployee] = await Promise.all([
+  const [allAbsences, allEmployees] = await Promise.all([
     fetchAllAbsencesForWeek(startStr, endStr),
     fetchAllEmployees(),
-    fetchConfirmedShortfallHours(period.startDate, period.endDate),
   ]);
   const idByEmail = new Map(
     allEmployees.map((e) => [e.email.toLowerCase(), e.id]),
+  );
+  const confirmedByEmployee = await fetchConfirmedShortfallHours(
+    targetEmployeeIds(candidates, idByEmail),
+    period.startDate,
+    period.endDate,
   );
   const excusedAbsence = excusedAbsenceByEmployee(allAbsences);
 
   const missingRows: MissingTimeRow[] = [];
   for (const row of candidates) {
     const apiMissing =
-      row.available_hours - row.billable_hours - row.non_billable_hours;
+      row.availableHours - row.billableHours - row.nonBillableHours;
     const employeeId = idByEmail.get(row.email.toLowerCase());
     const excusedDays = employeeId
       ? (excusedAbsence.get(employeeId)?.days ?? 0)
@@ -2002,7 +1951,7 @@ const notifyAdminMissingTime = async (period: ShortfallPeriod) => {
 
     missingRows.push({
       name: row.name,
-      lastDate: row.last_date,
+      lastDate: row.lastDate,
       missingHours: realMissing,
     });
   }
@@ -2046,34 +1995,26 @@ type ProjectHours = {
   category: ProjectCategory;
 };
 
-function aggregateProjectHours(
-  rows: ProjectHoursPerDayRow[],
-  projectInfo: Map<string, ProjectRow>,
-): ProjectHours[] {
-  // Collapse across dates per project ID, then resolve name and category
-  // via the projects map. Categories drive how rows are grouped in the
-  // table and whether they're counted as "work" or "absence".
-  const totals = new Map<string, number>();
+function aggregateProjectHours(rows: ProjectHoursPerDayRow[]): ProjectHours[] {
+  // Collapse across dates per project. Categories drive how rows are grouped
+  // in the table and whether they're counted as "work" or "absence".
+  const totals = new Map<string, ProjectHours>();
   for (const r of rows) {
     if (r.hours <= 0) continue;
-    totals.set(r.project, (totals.get(r.project) ?? 0) + r.hours);
-  }
-  const result: ProjectHours[] = [];
-  for (const [code, hours] of Array.from(totals)) {
-    const info = projectInfo.get(code);
-    let category: ProjectCategory;
-    if (info?.billable === "unavailable") {
-      category = "absence";
-    } else if (info?.billable === "billable") {
-      category = "billable";
-    } else {
-      // Defaults to non_billable when projects.billable says "non_billable"
-      // or when the project is missing from /projects entirely.
-      category = "non_billable";
+    const cur = totals.get(r.projectId);
+    if (cur) {
+      cur.hours += r.hours;
+      continue;
     }
-    const name = info?.name ?? code;
-    result.push({ name, hours, category });
+    const category: ProjectCategory =
+      r.status === "unavailable"
+        ? "absence"
+        : r.status === "billable"
+          ? "billable"
+          : "non_billable";
+    totals.set(r.projectId, { name: r.projectName, hours: r.hours, category });
   }
+  const result = Array.from(totals.values());
   // Sort: work projects first (billable, then non_billable), then absence.
   // Within each category, biggest hours at the top.
   const order: Record<ProjectCategory, number> = {
@@ -2265,8 +2206,7 @@ const notifyMonthlyRecap = async () => {
   const startStr = monthStart.format("YYYY-MM-DD");
   const endStr = monthEnd.format("YYYY-MM-DD");
   const monthLabel = monthStart.format("MMMM YYYY");
-  const year = monthStart.year();
-  const month = monthStart.month() + 1; // moment month is 0-indexed; SQL wants 1–12
+  const month = monthStart.format("YYYY-MM");
 
   console.info(`Monthly recap for ${monthLabel} (${startStr} → ${endStr})`);
 
@@ -2282,8 +2222,8 @@ const notifyMonthlyRecap = async () => {
     return;
   }
 
-  let targets = rows.filter((r) => r.available_hours > 0);
-  console.info(`${targets.length} employees with available_hours > 0`);
+  let targets = rows.filter((r) => r.availableHours > 0);
+  console.info(`${targets.length} employees with availableHours > 0`);
 
   if (TEST_USER_EMAIL) {
     const before = targets.length;
@@ -2298,28 +2238,13 @@ const notifyMonthlyRecap = async () => {
     return;
   }
 
-  const [
-    allEmployees,
-    allAbsences,
-    projectInfo,
-    bonusByEmployee,
-    fgByEmployee,
-    holidays,
-    confirmations,
-    slackUsersResp,
-  ] = await Promise.all([
-    fetchAllEmployees(),
-    fetchAllAbsencesForWeek(startStr, endStr),
-    fetchProjectInfoMap(),
-    fetchAllMonthlyBonuses(year, month),
-    fetchAllFGForRange(startStr, endStr),
-    fetchHolidays(startStr, endStr),
-    fetchWeekBalanceConfirmationsInRange(
-      monthStart.clone().startOf("isoWeek").format("YYYY-MM-DD"),
-      endStr,
-    ),
-    slack.users.list(),
-  ]);
+  const [allEmployees, allAbsences, holidays, slackUsersResp] =
+    await Promise.all([
+      fetchAllEmployees(),
+      fetchAllAbsencesForWeek(startStr, endStr),
+      fetchHolidays(startStr, endStr),
+      slack.users.list(),
+    ]);
 
   const slackUsers = slackUsersResp.members;
   if (!slackUsers) {
@@ -2333,20 +2258,24 @@ const notifyMonthlyRecap = async () => {
 
   const excusedAbsence = excusedAbsenceByEmployee(allAbsences);
 
+  // Weeks the employee has confirmed as avspasering, so their empty days
+  // aren't named as forgotten.
+  const targetIds = targetEmployeeIds(targets, idByEmail);
+  const [confirmedShortfalls, hoursByEmployee, fgByEmployee] =
+    await Promise.all([
+      fetchConfirmedShortfalls(
+        targetIds,
+        monthStart.clone().startOf("isoWeek").format("YYYY-MM-DD"),
+        endStr,
+      ),
+      fetchHoursByEmployee(targetIds, startStr, endStr),
+      fetchAllFGForRange(startStr, endStr),
+    ]);
   const confirmedByEmployee = confirmedShortfallHours(
-    confirmations,
+    confirmedShortfalls,
     monthStart,
     monthEnd,
   );
-  // Weeks the employee has confirmed as avspasering, so their empty days
-  // aren't named as forgotten.
-  const confirmedWeeksByEmployee = new Map<number, Set<string>>();
-  for (const c of confirmations) {
-    if (c.minutes >= 0) continue;
-    const weeks = confirmedWeeksByEmployee.get(c.employee) ?? new Set();
-    weeks.add(c.week_start);
-    confirmedWeeksByEmployee.set(c.employee, weeks);
-  }
 
   for (const row of targets) {
     const employeeId = idByEmail.get(row.email.toLowerCase());
@@ -2354,10 +2283,11 @@ const notifyMonthlyRecap = async () => {
       console.warn(`No employee_id for ${row.email}, skipping`);
       continue;
     }
+    const projectRows = hoursByEmployee.get(employeeId) ?? [];
     // Per-employee fetch wrapped: a single failure skips just this person.
-    let projectRows: ProjectHoursPerDayRow[];
+    let bonusKr: number;
     try {
-      projectRows = await fetchProjectHoursPerDay(employeeId, startStr, endStr);
+      bonusKr = await fetchMonthlyBonus(employeeId, month);
     } catch (err) {
       console.error(`Skipping ${row.email} — fetch failed:`, err);
       continue;
@@ -2366,14 +2296,12 @@ const notifyMonthlyRecap = async () => {
       billable: 0,
       available: 0,
     };
-    const bonusKr = bonusByEmployee.get(employeeId) ?? 0;
-
     const fgPct =
       fgRange.available > 0
         ? (fgRange.billable / fgRange.available) * 100
         : null;
 
-    const projects = aggregateProjectHours(projectRows, projectInfo);
+    const projects = aggregateProjectHours(projectRows);
 
     // Defensive: if FG indicates the employee did register hours but our
     // project query came back empty, something went wrong (404, parse
@@ -2390,20 +2318,20 @@ const notifyMonthlyRecap = async () => {
 
     // Shortfall: same logic as Tuesday, with absence-calendar tolerance
     const apiMissing =
-      row.available_hours - row.billable_hours - row.non_billable_hours;
+      row.availableHours - row.billableHours - row.nonBillableHours;
     const excusedDays = excusedAbsence.get(employeeId);
     const toleratedByAbsence =
       (excusedDays?.days ?? 0) * STANDARD_WORKDAY_HOURS;
 
     const excusedDates = excusedDays?.dates ?? new Set();
-    const confirmedWeeks =
-      confirmedWeeksByEmployee.get(employeeId) ?? new Set();
+    const confirmedWeeks = new Set(
+      confirmedShortfalls.get(employeeId)?.keys() ?? [],
+    );
     const emptyDays = buildPerDayBreakdown(
       monthStart,
       monthEnd,
       projectRows,
       holidays,
-      projectInfo,
     ).filter((d) => d.status === "empty" && !excusedDates.has(d.date));
     const emptyDates = emptyDays
       .filter(
