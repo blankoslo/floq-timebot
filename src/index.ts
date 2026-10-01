@@ -920,7 +920,7 @@ const notifySlackers = async () => {
   );
   const targetIds = targetEmployeeIds(targets, idByEmail);
   const [confirmedByEmployee, hoursByEmployee] = await Promise.all([
-    fetchConfirmedShortfallHours(startStr, targetIds),
+    fetchConfirmedShortfallHours(targetIds, startDate, endDate),
     fetchHoursByEmployee(targetIds, startStr, endStr),
   ]);
 
@@ -1589,11 +1589,6 @@ type ShortfallPeriod = {
   endDate: moment.Moment;
   label: string; // user-facing, e.g. "uke 20 (11.–15. mai)" or "april 2026"
   logTag: string; // for log lines, e.g. "Tuesday follow-up" or "Monthly nag"
-  // ISO Monday whose "bekreft avspasering" excuses a shortfall, set only when
-  // the period *is* that one week. No logic for month-long period.
-  // (The Monday digest doesn't build a ShortfallPeriod — it looks the
-  // confirmation up directly from its own week range.)
-  confirmationWeek?: string; // YYYY-MM-DD
 };
 
 function lastWeekShortfallPeriod(): ShortfallPeriod {
@@ -1611,7 +1606,6 @@ function lastWeekShortfallPeriod(): ShortfallPeriod {
     endDate,
     label: `uke ${weekNumber} (${first}–${last})`,
     logTag: "Tuesday follow-up",
-    confirmationWeek: startDate.format("YYYY-MM-DD"), // always an ISO Monday
   };
 }
 
@@ -1626,20 +1620,25 @@ function lastMonthShortfallPeriod(): ShortfallPeriod {
   };
 }
 
-// employee id → hours of avspasering confirmed for the week of `monday`.
-async function fetchConfirmedShortfallHours(
-  monday: string,
-  employeeIds: number[],
-): Promise<Map<number, number>> {
-  const shortfalls = await fetchConfirmedShortfalls(
-    employeeIds,
-    monday,
-    monday,
-  );
+// employee id → hours of avspasering confirmed within the period. Floq stores
+// one balance per week, so a week straddling the period's edge (a month
+// starting mid-week) counts by the share of its Mon–Fri inside it.
+function confirmedShortfallHours(
+  shortfalls: Map<number, Map<string, number>>,
+  startDate: moment.Moment,
+  endDate: moment.Moment,
+): Map<number, number> {
   const byEmployee = new Map<number, number>();
   for (const [employeeId, byWeek] of shortfalls) {
-    const hours = byWeek.get(monday);
-    if (hours !== undefined) byEmployee.set(employeeId, hours);
+    for (const [weekStart, weekHours] of byWeek) {
+      let weekdaysInPeriod = 0;
+      for (let i = 0; i < 5; i++) {
+        const day = moment(weekStart).add(i, "days");
+        if (day.isBetween(startDate, endDate, "day", "[]")) weekdaysInPeriod++;
+      }
+      const hours = weekHours * (weekdaysInPeriod / 5);
+      byEmployee.set(employeeId, (byEmployee.get(employeeId) ?? 0) + hours);
+    }
   }
   return byEmployee;
 }
@@ -1652,6 +1651,19 @@ function targetEmployeeIds(
     const id = idByEmail.get(r.email.toLowerCase());
     return id === undefined ? [] : [id];
   });
+}
+
+async function fetchConfirmedShortfallHours(
+  employeeIds: number[],
+  startDate: moment.Moment,
+  endDate: moment.Moment,
+): Promise<Map<number, number>> {
+  const shortfalls = await fetchConfirmedShortfalls(
+    employeeIds,
+    startDate.clone().startOf("isoWeek").format("YYYY-MM-DD"),
+    endDate.format("YYYY-MM-DD"),
+  );
+  return confirmedShortfallHours(shortfalls, startDate, endDate);
 }
 
 const notifyLateRegisterers = async (period: ShortfallPeriod) => {
@@ -1715,15 +1727,11 @@ const notifyLateRegisterers = async (period: ShortfallPeriod) => {
 
   const excusedAbsence = excusedAbsenceByEmployee(allAbsences);
 
-  // Confirmed avspasering, if this period is a single ISO week. Only then is
-  // there a confirmation to look up — the value is stored per week, so a
-  // month-long period simply has none and nobody is excused.
-  const confirmedByEmployee = period.confirmationWeek
-    ? await fetchConfirmedShortfallHours(
-        period.confirmationWeek,
-        targetEmployeeIds(targets, idByEmail),
-      )
-    : new Map<number, number>();
+  const confirmedByEmployee = await fetchConfirmedShortfallHours(
+    targetEmployeeIds(targets, idByEmail),
+    period.startDate,
+    period.endDate,
+  );
 
   for (const row of targets) {
     const apiMissing =
@@ -1807,8 +1815,7 @@ const notifyLateRegisterers = async (period: ShortfallPeriod) => {
 // the Monday/Tuesday/first-of-month triggers as an admin's-eye companion to the
 // personal DMs.
 //
-// Honours week_balance_confirmations on the same terms as the personal nudge,
-// via period.confirmationWeek.
+// Honours confirmed avspasering on the same terms as the personal nudge.
 
 type MissingTimeRow = {
   name: string;
@@ -1911,12 +1918,11 @@ const notifyAdminMissingTime = async (period: ShortfallPeriod) => {
   const idByEmail = new Map(
     allEmployees.map((e) => [e.email.toLowerCase(), e.id]),
   );
-  const confirmedByEmployee = period.confirmationWeek
-    ? await fetchConfirmedShortfallHours(
-        period.confirmationWeek,
-        targetEmployeeIds(candidates, idByEmail),
-      )
-    : new Map<number, number>();
+  const confirmedByEmployee = await fetchConfirmedShortfallHours(
+    targetEmployeeIds(candidates, idByEmail),
+    period.startDate,
+    period.endDate,
+  );
   const excusedAbsence = excusedAbsenceByEmployee(allAbsences);
 
   const missingRows: MissingTimeRow[] = [];
@@ -2252,8 +2258,8 @@ const notifyMonthlyRecap = async () => {
 
   const excusedAbsence = excusedAbsenceByEmployee(allAbsences);
 
-  // Weeks the employee has confirmed as avspasering (see
-  // fetchConfirmedShortfalls).
+  // Weeks the employee has confirmed as avspasering, so their empty days
+  // aren't named as forgotten.
   const targetIds = targetEmployeeIds(targets, idByEmail);
   const [confirmedShortfalls, hoursByEmployee, fgByEmployee] =
     await Promise.all([
@@ -2265,6 +2271,11 @@ const notifyMonthlyRecap = async () => {
       fetchHoursByEmployee(targetIds, startStr, endStr),
       fetchAllFGForRange(startStr, endStr),
     ]);
+  const confirmedByEmployee = confirmedShortfallHours(
+    confirmedShortfalls,
+    monthStart,
+    monthEnd,
+  );
 
   for (const row of targets) {
     const employeeId = idByEmail.get(row.email.toLowerCase());
@@ -2312,9 +2323,6 @@ const notifyMonthlyRecap = async () => {
     const toleratedByAbsence =
       (excusedDays?.days ?? 0) * STANDARD_WORKDAY_HOURS;
 
-    // Empty days in a confirmed-avspasering week are excused too. Floq only
-    // stores the confirmation per week, so any confirmation for the week
-    // covers its empty days, each tolerated like an excused calendar day.
     const excusedDates = excusedDays?.dates ?? new Set();
     const confirmedWeeks = new Set(
       confirmedShortfalls.get(employeeId)?.keys() ?? [],
@@ -2333,12 +2341,14 @@ const notifyMonthlyRecap = async () => {
           ),
       )
       .map((d) => d.date);
-    const toleratedByConfirmation =
-      (emptyDays.length - emptyDates.length) * STANDARD_WORKDAY_HOURS;
 
+    // Confirmed hours, not confirmed empty days: avspasering taken as shorter
+    // days leaves no day empty.
     const realMissing = Math.max(
       0,
-      apiMissing - toleratedByAbsence - toleratedByConfirmation,
+      apiMissing -
+        toleratedByAbsence -
+        (confirmedByEmployee.get(employeeId) ?? 0),
     );
 
     const targetUser = pickSlackRecipient(slackUsers, row.email);
