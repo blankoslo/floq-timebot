@@ -295,41 +295,25 @@ async function fetchAllEmployees(): Promise<EmployeeRow[]> {
   return apiGet<EmployeeRow[]>("/employees");
 }
 
-// employee id → week_start → hours of avspasering confirmed for that week.
-// confirmed-weeks only answers which confirmations still hold (the week's
-// balance hasn't slipped below what was confirmed); the minutes live on the
-// confirmation itself. Those are the signed week balance, so only a negative
-// value is a shortfall the user has owned up to.
-async function fetchConfirmedShortfalls(
+// employee id → Mondays of the weeks whose «Bekreft avspasering» still holds.
+// The platform only returns a week while its deficit is no larger than what
+// was confirmed, so a returned week is covered in full.
+async function fetchConfirmedWeeks(
   employeeIds: number[],
   fromMonday: string,
   toDate: string,
-): Promise<Map<number, Map<string, number>>> {
-  const result = new Map<number, Map<string, number>>();
+): Promise<Map<number, Set<string>>> {
+  const result = new Map<number, Set<string>>();
   // An empty employeeIds is an empty answer, not everyone's.
   if (employeeIds.length === 0) return result;
 
   const weeks = await apiGet<{ employeeId: number; weekStart: string }[]>(
     `/timesheet/confirmed-weeks?employeeIds=${employeeIds.join(",")}&from=${fromMonday}&to=${toDate}`,
   );
-  const confirmations = await Promise.all(
-    weeks.map(async (w) => {
-      const res = await apiFetch(
-        `/timesheet/balance-confirmation?employeeId=${w.employeeId}&weekStart=${w.weekStart}`,
-      );
-      // 204 = never confirmed. Can't follow a confirmed-weeks hit unless it
-      // was withdrawn in between.
-      if (res.status === 204) return null;
-      const { minutes } = (await res.json()) as { minutes: number };
-      return { ...w, minutes };
-    }),
-  );
-
-  for (const c of confirmations) {
-    if (!c || c.minutes >= 0) continue;
-    const byWeek = result.get(c.employeeId) ?? new Map<string, number>();
-    byWeek.set(c.weekStart, -c.minutes / 60);
-    result.set(c.employeeId, byWeek);
+  for (const w of weeks) {
+    const byEmployee = result.get(w.employeeId) ?? new Set<string>();
+    byEmployee.add(w.weekStart);
+    result.set(w.employeeId, byEmployee);
   }
   return result;
 }
@@ -518,16 +502,14 @@ type Shortfall = {
 const isoWeekOf = (date: string) =>
   moment(date).startOf("isoWeek").format("YYYY-MM-DD");
 
-// `days` cover whole ISO weeks. A confirmation covers its week's gaps in date
+// `days` cover whole ISO weeks. A confirmed week's gap is covered in date
 // order, so two months sharing a week split it the same way whichever runs
-// first, instead of each taking it whole. It is also capped at the week's
-// current gap: it keeps "holding" with its old minutes after the hours are
-// logged after all.
+// first, instead of each taking it whole.
 function shortfallOf(
   days: DayBreakdown[],
   start: string,
   end: string,
-  confirmedByWeek = new Map<string, number>(),
+  confirmedWeeks = new Set<string>(),
 ): Shortfall {
   const daysByWeek = new Map<string, DayBreakdown[]>();
   for (const d of days) {
@@ -540,20 +522,17 @@ function shortfallOf(
 
   let gap = 0;
   let confirmedHours = 0;
-  const confirmedWeeks = new Set<string>();
+  const coveredWeeks = new Set<string>();
   for (const [w, weekDays] of daysByWeek) {
     const insideGap = gapOf(weekDays.filter(inPeriod));
     const beforeGap = gapOf(weekDays.filter((d) => d.date < start));
     gap += insideGap;
-    const usable = Math.min(
-      confirmedByWeek.get(w) ?? 0,
-      Math.max(0, gapOf(weekDays)),
-    );
+    const usable = confirmedWeeks.has(w) ? Math.max(0, gapOf(weekDays)) : 0;
     const left = usable - Math.min(usable, Math.max(0, beforeGap));
     const confirmed = Math.min(left, Math.max(0, insideGap));
     confirmedHours += confirmed;
     if (confirmed > 0 && confirmed >= insideGap - REPORT_TOLERANCE_HOURS) {
-      confirmedWeeks.add(w);
+      coveredWeeks.add(w);
     }
   }
 
@@ -564,7 +543,7 @@ function shortfallOf(
         (d) =>
           inPeriod(d) &&
           d.status === "empty" &&
-          !confirmedWeeks.has(isoWeekOf(d.date)),
+          !coveredWeeks.has(isoWeekOf(d.date)),
       )
       .map((d) => d.date),
     confirmedHours,
@@ -604,7 +583,7 @@ async function loadEmployeePeriods(
   });
   const ids = employees.map((e) => e.id);
   const [confirmed, hours] = await Promise.all([
-    fetchConfirmedShortfalls(ids, weekStartStr, endStr),
+    fetchConfirmedWeeks(ids, weekStartStr, endStr),
     fetchHoursByEmployee(ids, weekStartStr, weekEndStr),
   ]);
 
