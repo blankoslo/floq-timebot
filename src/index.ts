@@ -415,16 +415,33 @@ const EXCUSED_ABSENCE_REASONS = new Set([
 type ExcusedAbsenceDays = { days: number; dates: Set<string> };
 
 // `days` is percentage-weighted, so a 50 % entry counts as half a day.
+// Only the part not also logged as time on the absence's own project counts:
+// time_tracking_status already takes logged "unavailable" hours out of
+// availableHours, so excusing those again would let each logged ferie day hide
+// a forgotten one. AVS is no project, so it is never logged and always counts.
 function excusedAbsenceByEmployee(
   absences: AbsenceRow[],
+  hoursByEmployee: Map<number, ProjectHoursPerDayRow[]>,
 ): Map<number, ExcusedAbsenceDays> {
+  const loggedHours = new Map<string, number>();
+  for (const rows of hoursByEmployee.values()) {
+    for (const r of rows) {
+      const key = `${r.employeeId}|${r.date}|${r.projectId}`;
+      loggedHours.set(key, (loggedHours.get(key) ?? 0) + r.hours);
+    }
+  }
+
   const result = new Map<number, ExcusedAbsenceDays>();
   for (const a of absences) {
     if (!EXCUSED_ABSENCE_REASONS.has(a.reason)) continue;
     const day = moment(a.date).day();
     if (day < 1 || day > 5) continue;
+    const logged =
+      loggedHours.get(`${a.employeeId}|${a.date}|${a.reason}`) ?? 0;
+    const unlogged = a.percentage / 100 - logged / STANDARD_WORKDAY_HOURS;
+    if (unlogged <= 0) continue;
     const cur = result.get(a.employeeId) ?? { days: 0, dates: new Set() };
-    cur.days += a.percentage / 100;
+    cur.days += unlogged;
     cur.dates.add(a.date);
     result.set(a.employeeId, cur);
   }
@@ -1725,12 +1742,14 @@ const notifyLateRegisterers = async (period: ShortfallPeriod) => {
     allEmployees.map((e) => [e.email.toLowerCase(), e.id]),
   );
 
-  const excusedAbsence = excusedAbsenceByEmployee(allAbsences);
-
-  const confirmedByEmployee = await fetchConfirmedShortfallHours(
-    targetEmployeeIds(targets, idByEmail),
-    period.startDate,
-    period.endDate,
+  const targetIds = targetEmployeeIds(targets, idByEmail);
+  const [confirmedByEmployee, hoursByEmployee] = await Promise.all([
+    fetchConfirmedShortfallHours(targetIds, period.startDate, period.endDate),
+    fetchHoursByEmployee(targetIds, startStr, endStr),
+  ]);
+  const excusedAbsence = excusedAbsenceByEmployee(
+    allAbsences,
+    hoursByEmployee,
   );
 
   for (const row of targets) {
@@ -1918,12 +1937,19 @@ const notifyAdminMissingTime = async (period: ShortfallPeriod) => {
   const idByEmail = new Map(
     allEmployees.map((e) => [e.email.toLowerCase(), e.id]),
   );
-  const confirmedByEmployee = await fetchConfirmedShortfallHours(
-    targetEmployeeIds(candidates, idByEmail),
-    period.startDate,
-    period.endDate,
+  const candidateIds = targetEmployeeIds(candidates, idByEmail);
+  const [confirmedByEmployee, hoursByEmployee] = await Promise.all([
+    fetchConfirmedShortfallHours(
+      candidateIds,
+      period.startDate,
+      period.endDate,
+    ),
+    fetchHoursByEmployee(candidateIds, startStr, endStr),
+  ]);
+  const excusedAbsence = excusedAbsenceByEmployee(
+    allAbsences,
+    hoursByEmployee,
   );
-  const excusedAbsence = excusedAbsenceByEmployee(allAbsences);
 
   const missingRows: MissingTimeRow[] = [];
   for (const row of candidates) {
@@ -2256,8 +2282,6 @@ const notifyMonthlyRecap = async () => {
     allEmployees.map((e) => [e.email.toLowerCase(), e.id]),
   );
 
-  const excusedAbsence = excusedAbsenceByEmployee(allAbsences);
-
   // Weeks the employee has confirmed as avspasering, so their empty days
   // aren't named as forgotten.
   const targetIds = targetEmployeeIds(targets, idByEmail);
@@ -2275,6 +2299,10 @@ const notifyMonthlyRecap = async () => {
     confirmedShortfalls,
     monthStart,
     monthEnd,
+  );
+  const excusedAbsence = excusedAbsenceByEmployee(
+    allAbsences,
+    hoursByEmployee,
   );
 
   for (const row of targets) {
