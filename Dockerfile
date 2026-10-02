@@ -26,6 +26,6 @@ WORKDIR /timebot
 COPY package.json package-lock.json /timebot/
 RUN npm ci --omit=dev
 
-COPY --from=build /timebot/dist/index.js /timebot/index.js
+COPY --from=build /timebot/dist /timebot/
 
 CMD [ "node", "index.js" ]
