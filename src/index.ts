@@ -447,8 +447,9 @@ function buildPerDayBreakdown(
   const isWeekend = (d: moment.Moment) => d.day() === 0 || d.day() === 6;
   // Dates are fixed-width YYYY-MM-DD, so string order is date order.
   const isEmployed = (ds: string) =>
-    (!employee.dateOfEmployment || ds >= employee.dateOfEmployment) &&
-    (!employee.terminationDate || ds <= employee.terminationDate);
+    employee.dateOfEmployment !== null &&
+    ds >= employee.dateOfEmployment &&
+    (employee.terminationDate === null || ds <= employee.terminationDate);
 
   // Enumerate all days in the period
   const allDays: moment.Moment[] = [];
