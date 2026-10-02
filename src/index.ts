@@ -130,6 +130,9 @@ type DayBreakdown = {
   holidayName?: string;
 };
 
+type SlackUser = { id?: string; name?: string; profile?: { email?: string } };
+type SlackMessage = { text: string; blocks?: Array<Record<string, unknown>> };
+
 // === API helpers ===
 const FLOQ_API_SCOPE = "role:read_only";
 const TOKEN_EXPIRY_BUFFER_SECONDS = 60;
@@ -181,17 +184,82 @@ async function apiToken(): Promise<string> {
 // can impersonate someone else's data while having the message land in our
 // own inbox.
 function pickSlackRecipient(
-  slackUsers: Array<{
-    id?: string;
-    name?: string;
-    profile?: { email?: string };
-  }>,
+  slackUsers: SlackUser[],
   originalEmail: string,
-): { id?: string; name?: string; profile?: { email?: string } } | undefined {
+): SlackUser | undefined {
   const targetEmail = (TEST_USER_SLACK_EMAIL ?? originalEmail).toLowerCase();
   return slackUsers.find(
     (u) => u.profile?.email?.toLowerCase() === targetEmail,
   );
+}
+
+async function fetchSlackUsers(): Promise<SlackUser[] | null> {
+  const resp = await slack.users.list();
+  if (!resp.members) {
+    console.error("No slack users in response:", resp);
+    return null;
+  }
+  return resp.members;
+}
+
+// `channel` is a user id or "#name". Posting by channel name needs no
+// channel listing, which would have needed groups:read for private channels;
+// the bot just has to be a member.
+async function postMessage(
+  channel: string,
+  recipient: string,
+  { text, blocks }: SlackMessage,
+): Promise<void> {
+  if (DRY_RUN) {
+    console.info(`DRY_RUN — preview for ${recipient}:\n${text}`);
+    return;
+  }
+  try {
+    await slack.chat.postMessage({
+      channel,
+      text,
+      // Slack's KnownBlock union is overly restrictive for our plain objects.
+      blocks: blocks as any,
+      as_user: true,
+    });
+    console.info(`Sent to ${recipient}`);
+  } catch (err) {
+    console.error(`Failed to send to ${recipient}:`, err);
+  }
+}
+
+async function sendDm(
+  slackUsers: SlackUser[],
+  email: string,
+  message: SlackMessage,
+): Promise<void> {
+  const user = pickSlackRecipient(slackUsers, email);
+  if (!user) {
+    console.error(`No Slack user found for ${email}`);
+    return;
+  }
+  await postMessage(user.id!, `@${user.name} (${email})`, message);
+}
+
+function linkButton(text: string, url: string): Record<string, unknown> {
+  return {
+    type: "actions",
+    elements: [{ type: "button", text: { type: "plain_text", text }, url }],
+  };
+}
+
+function onlyTestUser<T>(
+  items: T[],
+  emailOf: (item: T) => string | undefined,
+): T[] {
+  if (!TEST_USER_EMAIL) return items;
+  const kept = items.filter(
+    (i) => emailOf(i)?.toLowerCase() === TEST_USER_EMAIL,
+  );
+  console.info(
+    `TEST_USER_EMAIL=${TEST_USER_EMAIL} — filtered ${items.length} → ${kept.length} target(s)`,
+  );
+  return kept;
 }
 
 async function apiFetch(path: string, body?: unknown): Promise<Response> {
@@ -251,12 +319,36 @@ const invoicingReminderForce = process.env.INVOICING_REMINDER_FORCE === "true";
 const isMonthlyRecap =
   process.env.IS_MONTHLY_RECAP === "true" || (isMonday && now().date() <= 7);
 
-// Previous calendar week (Mon–Sun before today). Used by both the Monday
-// digest and the Tuesday follow-up — both report on the just-finished week.
-const getLastFullWeekRange = () => ({
-  startDate: now().subtract(1, "week").startOf("isoWeek"),
-  endDate: now().subtract(1, "week").endOf("isoWeek"),
-});
+type ReportPeriod = {
+  startDate: moment.Moment;
+  endDate: moment.Moment;
+  label: string; // user-facing, e.g. "uke 20 (11.–15. mai)" or "april 2026"
+};
+
+// The calendar week (Mon–Sun) before today, labelled by its work week.
+function lastWeekPeriod(): ReportPeriod {
+  const startDate = now().subtract(1, "week").startOf("isoWeek");
+  const endDate = startDate.clone().endOf("isoWeek");
+  const friday = startDate.clone().add(4, "days");
+  const first =
+    startDate.month() === friday.month()
+      ? startDate.format("D.")
+      : startDate.format("D. MMMM");
+  return {
+    startDate,
+    endDate,
+    label: `uke ${startDate.isoWeek()} (${first}–${friday.format("D. MMMM")})`,
+  };
+}
+
+function lastMonthPeriod(): ReportPeriod {
+  const startDate = now().subtract(1, "month").startOf("month");
+  return {
+    startDate,
+    endDate: startDate.clone().endOf("month"),
+    label: startDate.format("MMMM YYYY"),
+  };
+}
 
 // === Data fetching ===
 
@@ -607,6 +699,34 @@ async function loadEmployeePeriods(
   return result;
 }
 
+const hasShortfall = ({ missingHours, emptyDates }: Shortfall) =>
+  emptyDates.length > 0 || missingHours > REPORT_TOLERANCE_HOURS;
+
+type PeriodTarget = EmployeePeriod & { status: TimeTrackingStatusRow };
+
+// Everyone expected to work in the period. People on leave the whole period
+// (availableHours = 0) are left out.
+async function loadPeriodTargets(
+  { startDate, endDate }: ReportPeriod,
+  { testUserOnly }: { testUserOnly: boolean },
+): Promise<PeriodTarget[]> {
+  const rows = await fetchTimeTrackingStatus(startDate, endDate);
+  if (!Array.isArray(rows)) {
+    throw new Error(
+      `time_tracking_status did not return an array: ${JSON.stringify(rows)}`,
+    );
+  }
+  let targets = rows.filter((r) => r.availableHours > 0);
+  if (testUserOnly) targets = onlyTestUser(targets, (r) => r.email);
+  console.info(`${targets.length} employee(s) with availableHours > 0`);
+
+  const periods = await loadEmployeePeriods(targets, startDate, endDate);
+  return targets.flatMap((status) => {
+    const period = periods.get(status.email.toLowerCase());
+    return period ? [{ ...period, status }] : [];
+  });
+}
+
 // === Formatting ===
 
 function formatHours(n: number): string {
@@ -808,89 +928,68 @@ function formatPerDayLine(day: DayBreakdown, gapConfirmed = false): string {
   return icon ? `${base} ${icon}` : base;
 }
 
-const numberWord = (n: number): string => {
-  const words = [
-    "null",
-    "én",
-    "to",
-    "tre",
-    "fire",
-    "fem",
-    "seks",
-    "sju",
-    "åtte",
-    "ni",
-    "ti",
-  ];
-  return words[n] ?? String(n);
-};
-
-function summarize(
-  missingHours: number,
-  emptyDays: number,
-  partialDays: number,
-): string {
-  const totalDays = emptyDays + partialDays;
-  const missingLabel = `*${formatHoursShort(missingHours)} time${missingHours === 1 ? "" : "r"}*`;
-  const closing =
-    emptyDays === 0
-      ? "Ser du over og enten bekrefter avspasering eller fører resten? 🙏"
-      : "Ser du over og evt. fører resten? 🙏";
-
-  if (totalDays === 0) {
-    return `Du mangler totalt ${missingLabel}. ${closing}`;
-  }
-
-  const dayCountLabel = totalDays === 1 ? "*1 dag*" : `*${totalDays} dager*`;
-
-  if (emptyDays > 0 && partialDays > 0) {
-    const empty = emptyDays === 1 ? "én hel" : `${numberWord(emptyDays)} hele`;
-    const partial =
-      partialDays === 1 ? "én halvveis" : `${numberWord(partialDays)} halvveis`;
-    return `Til sammen mangler ${missingLabel} fordelt på ${dayCountLabel} (${empty} og ${partial}). ${closing}`;
-  }
-
-  return `Til sammen mangler ${missingLabel} fordelt på ${dayCountLabel}. ${closing}`;
+// "29. september og 1. oktober", "2., 9. og 16. september".
+function formatDates(dates: string[]): string {
+  const parts = dates.map((d, i) => {
+    const m = moment(d);
+    const next = dates[i + 1];
+    return next && moment(next).month() === m.month()
+      ? m.format("D.")
+      : m.format("D. MMMM");
+  });
+  return parts.length === 1
+    ? parts[0]
+    : `${parts.slice(0, -1).join(", ")} og ${parts[parts.length - 1]}`;
 }
 
+// Fully empty days are named explicitly: the net total alone can hide them
+// (7,5 t missing on one day minus 1,5 t extra elsewhere read as "6 timer
+// fordelt på 1 dag"). A gap only in partial days is more likely avspasering,
+// so that one asks for a confirmation instead.
+function shortfallSentence(
+  { missingHours, emptyDates }: Shortfall,
+  periodLabel: string,
+): string {
+  const hoursLabel = `*${formatHoursShort(missingHours)} time${missingHours === 1 ? "" : "r"}*`;
+  if (emptyDates.length === 0) {
+    return (
+      `Du mangler fortsatt ${hoursLabel} for *${periodLabel}*. ` +
+      `Ser du over og enten bekrefter avspasering eller fører resten? 🙏`
+    );
+  }
+  const totalClause =
+    missingHours > REPORT_TOLERANCE_HOURS
+      ? ` Totalt for *${periodLabel}* mangler du ${hoursLabel}.`
+      : "";
+  // Past a handful, a list of dates is harder to read than the count.
+  const emptyClause =
+    emptyDates.length > 5
+      ? `Du har *${emptyDates.length} dager* uten timer.`
+      : `Du har ikke ført noen timer på *${formatDates(emptyDates)}*.`;
+  return (
+    `${emptyClause}${totalClause} ` +
+    `Husk at ferie- og permisjonsdager også skal timeføres, og at avspasering skal bekreftes. ` +
+    `Ser du over og evt. fører resten? 🙏`
+  );
+}
+
+const timestampButton = () =>
+  linkButton("Åpne timeføring i Floq", FLOQ_TIMESTAMP_URL);
+
 function buildSlackMessage(
-  startDate: moment.Moment,
-  endDate: moment.Moment,
+  periodLabel: string,
   days: DayBreakdown[],
   totalActual: number,
   totalExpected: number,
-  hasIssues: boolean,
+  shortfallLine: string | null,
   gapConfirmed = false,
-): { text: string; blocks: Array<Record<string, unknown>> } {
-  const weekNumber = startDate.isoWeek();
-  // Display the work week (mon–fri) rather than the calendar week (mon–sun).
-  // For 1st-of-month partial-week runs, cap at endDate so we don't claim
-  // dates that haven't happened yet.
-  const fridayOfWeek = startDate.clone().add(4, "days");
-  const displayEnd = endDate.isBefore(fridayOfWeek) ? endDate : fridayOfWeek;
-  const sameMonth = startDate.month() === displayEnd.month();
-  const firstDate = sameMonth
-    ? startDate.format("D.")
-    : startDate.format("D. MMMM");
-  const lastDate = displayEnd.format("D. MMMM");
-  const periodLabel = `uke ${weekNumber} (${firstDate}-${lastDate})`;
-
+): SlackMessage {
   const perDayLines = days
     .map((d) => formatPerDayLine(d, gapConfirmed))
     .join("\n");
 
-  const emptyDays = days.filter((d) => d.status === "empty").length;
-  const partialDays = days.filter((d) => d.status === "partial").length;
-  const missingHours = Math.max(0, totalExpected - totalActual);
-
-  // Intro is brief by default; on shortfall we append the summary line.
-  // Caller decides via hasIssues (typically true when there's a gap, but
-  // suppressed when monthly recap fires the same day so we don't repeat
-  // shortfall info already in the recap).
   const baseIntro = `Her er en oversikt over timene dine for *${periodLabel}*.`;
-  const introLine = hasIssues
-    ? `${baseIntro} ${summarize(missingHours, emptyDays, partialDays)}`
-    : baseIntro;
+  const introLine = shortfallLine ? `${baseIntro} ${shortfallLine}` : baseIntro;
 
   // Plain-text fallback (no markdown asterisks)
   const textLines = [
@@ -902,156 +1001,63 @@ function buildSlackMessage(
   ];
   const text = textLines.join("\n");
 
-  const blocks: Array<Record<string, unknown>> = [
-    {
-      type: "section",
-      text: { type: "mrkdwn", text: introLine },
-    },
-  ];
-  blocks.push({
-    type: "actions",
-    elements: [
-      {
-        type: "button",
-        text: { type: "plain_text", text: "Åpne timeføring i Floq" },
-        url: FLOQ_TIMESTAMP_URL,
-      },
-    ],
-  });
   // Slack moves the table to the bottom of the message as an attachment
   // regardless of where it sits in the blocks array — so order here is
   // for the API, not for visual flow.
-  blocks.push(buildTableBlock(days, totalActual, totalExpected, gapConfirmed));
+  const blocks: Array<Record<string, unknown>> = [
+    { type: "section", text: { type: "mrkdwn", text: introLine } },
+    timestampButton(),
+    buildTableBlock(days, totalActual, totalExpected, gapConfirmed),
+  ];
 
   return { text, blocks };
 }
 
 // === Main flows ===
 
-const notifySlackers = async () => {
-  const { startDate, endDate } = getLastFullWeekRange();
-  const startStr = startDate.format("YYYY-MM-DD");
-  const endStr = endDate.format("YYYY-MM-DD");
+// Everyone expected to work last week gets the overview, including those who
+// are fully registered. `withShortfall` is off when the monthly recap goes
+// out the same day, which reports the shortfall at month scope.
+const notifySlackers = async ({
+  withShortfall,
+}: {
+  withShortfall: boolean;
+}) => {
+  const period = lastWeekPeriod();
+  console.info(`Weekly digest for ${period.label}`);
 
-  console.info(`Checking time tracking for ${startStr} → ${endStr}`);
+  const targets = await loadPeriodTargets(period, { testUserOnly: true });
+  if (targets.length === 0) return;
+  const slackUsers = await fetchSlackUsers();
+  if (!slackUsers) return;
 
-  let rows: TimeTrackingStatusRow[];
-  try {
-    rows = await fetchTimeTrackingStatus(startDate, endDate);
-  } catch (err) {
-    console.error("time_tracking_status failed:", err);
-    return;
-  }
-  if (!Array.isArray(rows)) {
-    console.error("time_tracking_status did not return an array:", rows);
-    return;
-  }
-  console.info(`Got ${rows.length} rows from time_tracking_status`);
-
-  // We notify everyone who is expected to work this week — including those
-  // who are fully registered (they get the brief variant). People on full-
-  // week vacation/parental leave (availableHours = 0) get nothing.
-  let targets = rows.filter((r) => r.availableHours > 0);
-  console.info(`${targets.length} employees with availableHours > 0`);
-
-  if (TEST_USER_EMAIL) {
-    const before = targets.length;
-    targets = targets.filter((r) => r.email.toLowerCase() === TEST_USER_EMAIL);
-    console.info(
-      `TEST_USER_EMAIL=${TEST_USER_EMAIL} — filtered ${before} → ${targets.length} target(s)`,
-    );
-    if (targets.length === 0) {
-      console.warn(
-        `No employee matching ${TEST_USER_EMAIL} in time_tracking_status — nothing to send`,
-      );
-      return;
-    }
-  }
-
-  if (targets.length === 0) {
-    console.info("Nothing to notify, exiting notifySlackers.");
-    return;
-  }
-
-  const [periods, slackUsersResp] = await Promise.all([
-    loadEmployeePeriods(targets, startDate, endDate),
-    slack.users.list(),
-  ]);
-
-  const slackUsers = slackUsersResp.members;
-  if (!slackUsers) {
-    console.error("No slack users in response:", slackUsersResp);
-    return;
-  }
-
-  for (const row of targets) {
-    const period = periods.get(row.email.toLowerCase());
-    if (!period) continue;
-    const { days, shortfall } = period;
-
-    // Headline totals sum across all surviving days. The filter inside
-    // buildPerDayBreakdown already dropped weekends-without-work and other
-    // noise — anything still here counts. Absence and holiday days have
-    // hoursExpected = 0 so they only contribute to the "actual" side.
+  for (const { status, days, shortfall } of targets) {
+    // Absence and holiday days have hoursExpected = 0, so they only count
+    // toward the "actual" side.
     const totalActual = days.reduce((s, d) => s + d.hoursActual, 0);
     const totalExpected = days.reduce((s, d) => s + d.hoursExpected, 0);
+    const confirmedCoversGap =
+      shortfall.confirmedHours > 0 && !hasShortfall(shortfall);
+    const shortfallLine =
+      withShortfall && hasShortfall(shortfall)
+        ? shortfallSentence(shortfall, period.label)
+        : null;
 
-    const targetUser = pickSlackRecipient(slackUsers, row.email);
-    if (!targetUser) {
-      console.error(`No Slack user found for ${row.email}`);
-      continue;
-    }
-
-    // Include shortfall paragraph when there's a gap — except on first-
-    // Monday runs, where the monthly recap fires the same day and would
-    // duplicate the shortfall info at a wider scope.
-    const hasShortfall =
-      shortfall.emptyDates.length > 0 ||
-      shortfall.missingHours > REPORT_TOLERANCE_HOURS;
-    const confirmedCoversGap = shortfall.confirmedHours > 0 && !hasShortfall;
-    if (confirmedCoversGap) {
-      console.info(
-        `${row.email}: dropper shortfall-avsnitt — gapet er dekket av ${formatHours(shortfall.confirmedHours)} t bekreftet avspasering`,
-      );
-    }
-
-    const hasIssues = hasShortfall && !isMonthlyRecap;
-
-    const { text, blocks } = buildSlackMessage(
-      startDate,
-      endDate,
-      days,
-      totalActual,
-      totalExpected,
-      hasIssues,
-      confirmedCoversGap,
-    );
-
-    const emptyDays = days.filter((d) => d.status === "empty").length;
-    const partialDays = days.filter((d) => d.status === "partial").length;
-    const variant = hasIssues ? "issues" : "brief";
     console.info(
-      `Notifying @${targetUser.name} (${row.email}) [${variant}] — ${formatHours(totalActual)}/${formatHours(totalExpected)} t, ${emptyDays} empty + ${partialDays} partial`,
+      `Weekly digest → ${status.email} [${shortfallLine ? "issues" : "brief"}] — ${formatHours(totalActual)}/${formatHours(totalExpected)} t, missing ${formatHours(shortfall.missingHours)} t, ${shortfall.emptyDates.length} empty day(s)${confirmedCoversGap ? `, ${formatHours(shortfall.confirmedHours)} t bekreftet avspasering` : ""}`,
     );
-
-    if (DRY_RUN) {
-      console.info("DRY_RUN — message preview:\n" + text);
-      continue;
-    }
-
-    try {
-      await slack.chat.postMessage({
-        channel: targetUser.id!,
-        text,
-        // Casting because we build blocks as plain objects; Slack's KnownBlock
-        // union is overly restrictive for our simple section/actions/context mix.
-        blocks: blocks as any,
-        as_user: true,
-      });
-      console.info(`Sent to @${targetUser.name}`);
-    } catch (err) {
-      console.error(`Failed to send to @${targetUser.name}:`, err);
-    }
+    await sendDm(
+      slackUsers,
+      status.email,
+      buildSlackMessage(
+        period.label,
+        days,
+        totalActual,
+        totalExpected,
+        shortfallLine,
+        confirmedCoversGap,
+      ),
+    );
   }
 };
 
@@ -1076,26 +1082,7 @@ const notifyAdminAboutOvertime = async () => {
     "Overtid: https://inni.blank.no/overtime";
 
   console.info(`Overtime entries: ${entries.length}`);
-  console.info(message);
-
-  if (DRY_RUN) {
-    console.info("DRY_RUN — not posting overtime notification");
-    return;
-  }
-
-  // Post directly by channel name — chat.postMessage accepts "#name" and
-  // doesn't require enumerating channels first, which would have needed
-  // groups:read scope for private channels. Bot just needs to be a member.
-  try {
-    await slack.chat.postMessage({
-      channel: `#${channelName}`,
-      text: message,
-      as_user: true,
-    });
-    console.info(`Sent to #${channelName}`);
-  } catch (err) {
-    console.error(`Failed to post to #${channelName}:`, err);
-  }
+  await postMessage(`#${channelName}`, `#${channelName}`, { text: message });
 };
 
 // === Reminder til oppdragsansvarlig: fakturering ===
@@ -1121,7 +1108,7 @@ function invoicingReminderSendDate(
 function buildInvoicingReminderMessage(
   monthLabel: string,
   projects: InvoiceProjectRow[],
-): { text: string; blocks: Array<Record<string, unknown>> } {
+): SlackMessage {
   const projectLines = projects.map((p) => `• ${p.name} (${p.id})`).join("\n");
   const ownsClause =
     projects.length === 1
@@ -1137,16 +1124,7 @@ function buildInvoicingReminderMessage(
 
   const blocks: Array<Record<string, unknown>> = [
     { type: "section", text: { type: "mrkdwn", text: message } },
-    {
-      type: "actions",
-      elements: [
-        {
-          type: "button",
-          text: { type: "plain_text", text: "Åpne fakturering i Floq" },
-          url: FLOQ_INVOICE_URL,
-        },
-      ],
-    },
+    linkButton("Åpne fakturering i Floq", FLOQ_INVOICE_URL),
   ];
 
   return { text, blocks };
@@ -1195,30 +1173,15 @@ const notifyInvoicingResponsible = async () => {
 
   console.info(`Invoicing reminder for ${monthLabel}`);
 
-  const [projects, allEmployees, slackUsersResp] = await Promise.all([
+  const [projects, allEmployees, slackUsers] = await Promise.all([
     fetchActiveBillableProjectsWithResponsible(),
     fetchAllEmployees(),
-    slack.users.list(),
+    fetchSlackUsers(),
   ]);
-
-  const slackUsers = slackUsersResp.members;
-  if (!slackUsers) {
-    console.error("No slack users in response");
-    return;
-  }
+  if (!slackUsers) return;
 
   const emailById = new Map(allEmployees.map((e) => [e.id, e.email]));
-
-  let targets = projects;
-  if (TEST_USER_EMAIL) {
-    const before = targets.length;
-    targets = targets.filter(
-      (p) => emailById.get(p.responsible)?.toLowerCase() === TEST_USER_EMAIL,
-    );
-    console.info(
-      `TEST_USER_EMAIL=${TEST_USER_EMAIL} — filtered ${before} → ${targets.length} target(s)`,
-    );
-  }
+  const targets = onlyTestUser(projects, (p) => emailById.get(p.responsible));
 
   const projectsByResponsible = new Map<number, InvoiceProjectRow[]>();
   for (const p of targets) {
@@ -1246,39 +1209,15 @@ const notifyInvoicingResponsible = async () => {
       );
       continue;
     }
-    const targetUser = pickSlackRecipient(slackUsers, email);
-    if (!targetUser) {
-      console.error(`No Slack user found for ${email}`);
-      continue;
-    }
-
     ownedProjects.sort((a, b) => a.name.localeCompare(b.name, "nb"));
-
-    const { text, blocks } = buildInvoicingReminderMessage(
-      monthLabel,
-      ownedProjects,
-    );
-
     console.info(
-      `Invoicing reminder → @${targetUser.name} (${email}) — ${ownedProjects.length} prosjekt(er)`,
+      `Invoicing reminder → ${email} — ${ownedProjects.length} prosjekt(er)`,
     );
-
-    if (DRY_RUN) {
-      console.info("DRY_RUN — message preview:\n" + text);
-      continue;
-    }
-
-    try {
-      await slack.chat.postMessage({
-        channel: targetUser.id!,
-        text,
-        blocks: blocks as any,
-        as_user: true,
-      });
-      console.info(`Sent to @${targetUser.name}`);
-    } catch (err) {
-      console.error(`Failed to send to @${targetUser.name}:`, err);
-    }
+    await sendDm(
+      slackUsers,
+      email,
+      buildInvoicingReminderMessage(monthLabel, ownedProjects),
+    );
   }
 };
 
@@ -1427,7 +1366,7 @@ function buildAvailabilityMessage(
   isoWeeks: number[],
   totalWorkdays: number,
   people: EmployeeAvailability[],
-): { text: string; blocks: Array<Record<string, unknown>> } {
+): SlackMessage {
   // Nobody free → a single celebratory line, no headline or table.
   if (people.length === 0) {
     const line = `Det er ingen med ledig tid neste ${isoWeeks.length} uker 🎉`;
@@ -1553,211 +1492,59 @@ const notifyAvailableConsultants = async () => {
     workdays,
   );
 
-  const { text, blocks } = buildAvailabilityMessage(
-    weekStart,
-    windowEnd,
-    isoWeeks,
-    workdays.length,
-    people,
-  );
-
   console.info(
     `Availability: ${people.length}/${employees.length} employees with ≥1 free day over ${workdays.length} workdays`,
   );
-
-  if (DRY_RUN) {
-    console.info("DRY_RUN — availability preview:\n" + text);
-    return;
-  }
-
-  try {
-    await slack.chat.postMessage({
-      channel: `#${CAPACITY_CHANNEL}`,
-      text,
-      blocks: blocks as any,
-      as_user: true,
-    });
-    console.info(`Sent availability overview to #${CAPACITY_CHANNEL}`);
-  } catch (err) {
-    console.error(`Failed to post to #${CAPACITY_CHANNEL}:`, err);
-  }
+  await postMessage(
+    `#${CAPACITY_CHANNEL}`,
+    `#${CAPACITY_CHANNEL}`,
+    buildAvailabilityMessage(
+      weekStart,
+      windowEnd,
+      isoWeeks,
+      workdays.length,
+      people,
+    ),
+  );
 };
 
-// === Tuesday: follow-up nudge to stragglers ===
+// === Tuesday / first-of-month: follow-up nudge to stragglers ===
 
 function buildLateRegisterMessage(
   periodLabel: string,
-  missingHours: number,
-  missingDays: number,
-): { text: string; blocks: Array<Record<string, unknown>> } {
-  const hoursLabel = `*${formatHoursShort(missingHours)} time${missingHours === 1 ? "" : "r"}*`;
-  const daysLabel = missingDays === 1 ? "*1 dag*" : `*${missingDays} dager*`;
-
-  // The day count only counts fully empty workdays. At 0 the gap sits in partial days, more likely
-  // avspasering than forgotten timeføring, so ask for a confirmation instead
-  // (and skip the "fordelt på N dager" clause, which would read "0 dager").
-  const message =
-    missingDays === 0
-      ? `Du mangler fortsatt ${hoursLabel} for *${periodLabel}*. ` +
-        `Ser du over og enten bekrefter avspasering eller fører resten? 🙏`
-      : `Du mangler fortsatt ${hoursLabel} fordelt på ${daysLabel} for *${periodLabel}*. ` +
-        `Husk at ferie- og permisjonsdager også skal timeføres, og at avspasering skal bekreftes. ` +
-        `Ser du over og evt. fører resten? 🙏`;
-
-  const text =
-    message.replace(/\*/g, "") + `\n\nÅpne timeføring: ${FLOQ_TIMESTAMP_URL}`;
-
-  const blocks: Array<Record<string, unknown>> = [
-    {
-      type: "section",
-      text: { type: "mrkdwn", text: message },
-    },
-    {
-      type: "actions",
-      elements: [
-        {
-          type: "button",
-          text: { type: "plain_text", text: "Åpne timeføring i Floq" },
-          url: FLOQ_TIMESTAMP_URL,
-        },
-      ],
-    },
-  ];
-
-  return { text, blocks };
-}
-
-type ShortfallPeriod = {
-  startDate: moment.Moment;
-  endDate: moment.Moment;
-  label: string; // user-facing, e.g. "uke 20 (11.–15. mai)" or "april 2026"
-  logTag: string; // for log lines, e.g. "Tuesday follow-up" or "Monthly nag"
-};
-
-function lastWeekShortfallPeriod(): ShortfallPeriod {
-  const { startDate, endDate } = getLastFullWeekRange();
-  const weekNumber = startDate.isoWeek();
-  const fridayOfWeek = startDate.clone().add(4, "days");
-  const displayEnd = endDate.isBefore(fridayOfWeek) ? endDate : fridayOfWeek;
-  const sameMonth = startDate.month() === displayEnd.month();
-  const first = sameMonth
-    ? startDate.format("D.")
-    : startDate.format("D. MMMM");
-  const last = displayEnd.format("D. MMMM");
+  shortfall: Shortfall,
+): SlackMessage {
+  const message = shortfallSentence(shortfall, periodLabel);
   return {
-    startDate,
-    endDate,
-    label: `uke ${weekNumber} (${first}–${last})`,
-    logTag: "Tuesday follow-up",
+    text:
+      message.replace(/\*/g, "") + `\n\nÅpne timeføring: ${FLOQ_TIMESTAMP_URL}`,
+    blocks: [
+      { type: "section", text: { type: "mrkdwn", text: message } },
+      timestampButton(),
+    ],
   };
 }
 
-function lastMonthShortfallPeriod(): ShortfallPeriod {
-  const startDate = now().subtract(1, "month").startOf("month");
-  const endDate = startDate.clone().endOf("month");
-  return {
-    startDate,
-    endDate,
-    label: startDate.format("MMMM YYYY"),
-    logTag: "First-of-month nag",
-  };
-}
+const notifyLateRegisterers = async (period: ReportPeriod) => {
+  console.info(`Shortfall nudge for ${period.label}`);
 
-const notifyLateRegisterers = async (period: ShortfallPeriod) => {
-  const { startDate, endDate, label: periodLabel, logTag } = period;
-  const startStr = startDate.format("YYYY-MM-DD");
-  const endStr = endDate.format("YYYY-MM-DD");
+  const targets = (
+    await loadPeriodTargets(period, { testUserOnly: true })
+  ).filter((t) => hasShortfall(t.shortfall));
+  console.info(`${targets.length} still with a shortfall`);
+  if (targets.length === 0) return;
+  const slackUsers = await fetchSlackUsers();
+  if (!slackUsers) return;
 
-  console.info(`${logTag} for ${startStr} → ${endStr}`);
-
-  let rows: TimeTrackingStatusRow[];
-  try {
-    rows = await fetchTimeTrackingStatus(startDate, endDate);
-  } catch (err) {
-    console.error("time_tracking_status failed:", err);
-    return;
-  }
-  if (!Array.isArray(rows)) {
-    console.error("time_tracking_status did not return an array:", rows);
-    return;
-  }
-
-  // Only nag the ones who *still* have a shortfall after Monday's reminder.
-  let targets = rows.filter((r) => {
-    if (r.availableHours <= 0) return false;
-    const registered = r.billableHours + r.nonBillableHours;
-    return registered < r.availableHours - REPORT_TOLERANCE_HOURS;
-  });
-  console.info(`${targets.length} still below availableHours`);
-
-  if (TEST_USER_EMAIL) {
-    const before = targets.length;
-    targets = targets.filter((r) => r.email.toLowerCase() === TEST_USER_EMAIL);
+  for (const { status, shortfall } of targets) {
     console.info(
-      `TEST_USER_EMAIL=${TEST_USER_EMAIL} — filtered ${before} → ${targets.length} target(s)`,
+      `Nudging ${status.email} — still missing ${formatHours(shortfall.missingHours)} t, ${shortfall.emptyDates.length} empty day(s)`,
     );
-  }
-
-  if (targets.length === 0) {
-    console.info("Nothing to nag on Tuesday.");
-    return;
-  }
-
-  const [periods, slackUsersResp] = await Promise.all([
-    loadEmployeePeriods(targets, startDate, endDate),
-    slack.users.list(),
-  ]);
-
-  const slackUsers = slackUsersResp.members;
-  if (!slackUsers) {
-    console.error("No slack users in response");
-    return;
-  }
-
-  for (const row of targets) {
-    const shortfall = periods.get(row.email.toLowerCase())?.shortfall;
-    if (!shortfall) continue;
-    const { missingHours, emptyDates, confirmedHours } = shortfall;
-    const missingDays = emptyDates.length;
-    if (missingHours <= REPORT_TOLERANCE_HOURS) {
-      console.info(
-        `Skipping ${row.email}: ${formatHours(confirmedHours)} t bekreftet avspasering dekker gapet`,
-      );
-      continue;
-    }
-
-    const targetUser = pickSlackRecipient(slackUsers, row.email);
-    if (!targetUser) {
-      console.error(`No Slack user found for ${row.email}`);
-      continue;
-    }
-
-    const { text, blocks } = buildLateRegisterMessage(
-      periodLabel,
-      missingHours,
-      missingDays,
+    await sendDm(
+      slackUsers,
+      status.email,
+      buildLateRegisterMessage(period.label, shortfall),
     );
-
-    console.info(
-      `Nudging @${targetUser.name} (${row.email}) — still missing ${formatHours(missingHours)} t, ${missingDays} empty day(s)`,
-    );
-
-    if (DRY_RUN) {
-      console.info("DRY_RUN — message preview:\n" + text);
-      continue;
-    }
-
-    try {
-      await slack.chat.postMessage({
-        channel: targetUser.id!,
-        text,
-        blocks: blocks as any,
-        as_user: true,
-      });
-      console.info(`Sent to @${targetUser.name}`);
-    } catch (err) {
-      console.error(`Failed to send to @${targetUser.name}:`, err);
-    }
   }
 };
 
@@ -1777,7 +1564,7 @@ type MissingTimeRow = {
 function buildAdminMissingMessage(
   periodLabel: string,
   rows: MissingTimeRow[],
-): { text: string; blocks: Array<Record<string, unknown>> } {
+): SlackMessage {
   if (rows.length === 0) {
     const line = `Alle har ført timene sine for *${periodLabel}* 🎉`;
     return {
@@ -1833,77 +1620,31 @@ function buildAdminMissingMessage(
   return { text, blocks };
 }
 
-const notifyAdminMissingTime = async (period: ShortfallPeriod) => {
-  const { startDate, endDate, label: periodLabel, logTag } = period;
-  const startStr = startDate.format("YYYY-MM-DD");
-  const endStr = endDate.format("YYYY-MM-DD");
+const notifyAdminMissingTime = async (period: ReportPeriod) => {
+  console.info(`Admin missing-time overview for ${period.label}`);
+
+  const targets = await loadPeriodTargets(period, { testUserOnly: false });
+  const missingRows: MissingTimeRow[] = targets
+    .filter((t) => t.shortfall.missingHours > REPORT_TOLERANCE_HOURS)
+    .map((t) => ({
+      name: t.status.name,
+      lastDate: t.status.lastDate,
+      missingHours: t.shortfall.missingHours,
+    }))
+    // Biggest gaps first; ties by name.
+    .sort(
+      (a, b) =>
+        b.missingHours - a.missingHours || a.name.localeCompare(b.name, "nb"),
+    );
 
   console.info(
-    `Admin missing-time overview (${logTag}) for ${startStr} → ${endStr}`,
+    `Admin missing-time: ${missingRows.length} with a real shortfall for ${period.label}`,
   );
-
-  let rows: TimeTrackingStatusRow[];
-  try {
-    rows = await fetchTimeTrackingStatus(startDate, endDate);
-  } catch (err) {
-    console.error("time_tracking_status failed:", err);
-    return;
-  }
-  if (!Array.isArray(rows)) {
-    console.error("time_tracking_status did not return an array:", rows);
-    return;
-  }
-
-  // Only those who owed time this period (registered < available).
-  const candidates = rows.filter((r) => {
-    if (r.availableHours <= 0) return false;
-    const registered = r.billableHours + r.nonBillableHours;
-    return registered < r.availableHours - REPORT_TOLERANCE_HOURS;
-  });
-
-  const periods = await loadEmployeePeriods(candidates, startDate, endDate);
-
-  const missingRows: MissingTimeRow[] = [];
-  for (const row of candidates) {
-    const missingHours =
-      periods.get(row.email.toLowerCase())?.shortfall.missingHours ?? 0;
-    if (missingHours <= REPORT_TOLERANCE_HOURS) continue;
-
-    missingRows.push({
-      name: row.name,
-      lastDate: row.lastDate,
-      missingHours,
-    });
-  }
-
-  // Biggest gaps first; ties by name.
-  missingRows.sort(
-    (a, b) =>
-      b.missingHours - a.missingHours || a.name.localeCompare(b.name, "nb"),
+  await postMessage(
+    `#${CAPACITY_CHANNEL}`,
+    `#${CAPACITY_CHANNEL}`,
+    buildAdminMissingMessage(period.label, missingRows),
   );
-
-  const { text, blocks } = buildAdminMissingMessage(periodLabel, missingRows);
-
-  console.info(
-    `Admin missing-time: ${missingRows.length} with a real shortfall for ${periodLabel}`,
-  );
-
-  if (DRY_RUN) {
-    console.info("DRY_RUN — admin missing-time preview:\n" + text);
-    return;
-  }
-
-  try {
-    await slack.chat.postMessage({
-      channel: `#${CAPACITY_CHANNEL}`,
-      text,
-      blocks: blocks as any,
-      as_user: true,
-    });
-    console.info(`Sent admin missing-time overview to #${CAPACITY_CHANNEL}`);
-  } catch (err) {
-    console.error(`Failed to post to #${CAPACITY_CHANNEL}:`, err);
-  }
 };
 
 // === First-of-month: monthly recap ===
@@ -1997,30 +1738,18 @@ function buildProjectTableBlock(
   };
 }
 
-// "4., 5. og 12. august" — all dates are assumed to be in the same month.
-function formatDatesInMonth(dates: string[]): string {
-  const days = dates.map((d) => moment(d).format("D."));
-  const joined =
-    days.length === 1
-      ? days[0]
-      : `${days.slice(0, -1).join(", ")} og ${days[days.length - 1]}`;
-  return `${joined} ${moment(dates[0]).format("MMMM")}`;
-}
-
 function buildMonthlyRecapMessage(params: {
   monthLabel: string;
-  missingHours: number; // 0 if no shortfall
-  emptyDates: string[]; // workdays with nothing registered and no excuse
+  shortfall: Shortfall;
   fgPct: number | null;
   billableHours: number;
   availableHours: number;
   bonusKr: number;
   projects: ProjectHours[];
-}): { text: string; blocks: Array<Record<string, unknown>> } {
+}): SlackMessage {
   const {
     monthLabel,
-    missingHours,
-    emptyDates,
+    shortfall,
     fgPct,
     billableHours,
     availableHours,
@@ -2034,26 +1763,9 @@ function buildMonthlyRecapMessage(params: {
 
   const introLine = `Her er månedsoppsummeringen din for *${monthLabel}*.`;
 
-  // Fully empty days are named explicitly: the net total alone can hide them
-  // (7,5 t missing on one day minus 1,5 t extra elsewhere read as "6 timer
-  // fordelt på 1 dag"). Partial-only gaps are more likely avspasering, so
-  // those get the confirm-or-register phrasing used by the weekly nudges.
-  let shortfallLine: string | null = null;
-  const hasMissingHours = missingHours > REPORT_TOLERANCE_HOURS;
-  const hoursLabel = `*${formatHoursShort(missingHours)} time${missingHours === 1 ? "" : "r"}*`;
-  if (emptyDates.length > 0) {
-    const totalClause = hasMissingHours
-      ? ` Totalt for *${monthLabel}* mangler du ${hoursLabel}.`
-      : "";
-    shortfallLine =
-      `Du har ikke ført noen timer på *${formatDatesInMonth(emptyDates)}*.${totalClause} ` +
-      `Husk at ferie- og permisjonsdager også skal timeføres, og at avspasering skal bekreftes. ` +
-      `Ser du over og evt. fører resten? 🙏`;
-  } else if (hasMissingHours) {
-    shortfallLine =
-      `Du mangler fortsatt ${hoursLabel} for *${monthLabel}*. ` +
-      `Ser du over og enten bekrefter avspasering eller fører resten? 🙏`;
-  }
+  const shortfallLine = hasShortfall(shortfall)
+    ? shortfallSentence(shortfall, monthLabel)
+    : null;
 
   const statsLines: string[] = [];
   if (fgPct !== null && availableHours > 0) {
@@ -2104,85 +1816,37 @@ function buildMonthlyRecapMessage(params: {
     type: "section",
     text: { type: "mrkdwn", text: statsLines.join("\n") },
   });
-  blocks.push({
-    type: "actions",
-    elements: [
-      {
-        type: "button",
-        text: { type: "plain_text", text: "Åpne timeføring i Floq" },
-        url: FLOQ_TIMESTAMP_URL,
-      },
-    ],
-  });
+  blocks.push(timestampButton());
   blocks.push(buildProjectTableBlock(projects, availableHours));
 
   return { text, blocks };
 }
 
 const notifyMonthlyRecap = async () => {
-  // Previous calendar month — e.g. on June 1 covers May 1 → May 31.
-  const monthStart = now().subtract(1, "month").startOf("month");
-  const monthEnd = monthStart.clone().endOf("month");
-  const startStr = monthStart.format("YYYY-MM-DD");
-  const endStr = monthEnd.format("YYYY-MM-DD");
-  const monthLabel = monthStart.format("MMMM YYYY");
-  const month = monthStart.format("YYYY-MM");
+  const period = lastMonthPeriod();
+  const startStr = period.startDate.format("YYYY-MM-DD");
+  const endStr = period.endDate.format("YYYY-MM-DD");
+  const month = period.startDate.format("YYYY-MM");
+  console.info(`Monthly recap for ${period.label}`);
 
-  console.info(`Monthly recap for ${monthLabel} (${startStr} → ${endStr})`);
-
-  let rows: TimeTrackingStatusRow[];
-  try {
-    rows = await fetchTimeTrackingStatus(monthStart, monthEnd);
-  } catch (err) {
-    console.error("time_tracking_status failed:", err);
-    return;
-  }
-  if (!Array.isArray(rows)) {
-    console.error("time_tracking_status did not return an array:", rows);
-    return;
-  }
-
-  let targets = rows.filter((r) => r.availableHours > 0);
-  console.info(`${targets.length} employees with availableHours > 0`);
-
-  if (TEST_USER_EMAIL) {
-    const before = targets.length;
-    targets = targets.filter((r) => r.email.toLowerCase() === TEST_USER_EMAIL);
-    console.info(
-      `TEST_USER_EMAIL=${TEST_USER_EMAIL} — filtered ${before} → ${targets.length} target(s)`,
-    );
-  }
-
-  if (targets.length === 0) {
-    console.info("Nothing to send for monthly recap.");
-    return;
-  }
-
-  const [periods, fgByEmployee, slackUsersResp] = await Promise.all([
-    loadEmployeePeriods(targets, monthStart, monthEnd),
+  const targets = await loadPeriodTargets(period, { testUserOnly: true });
+  if (targets.length === 0) return;
+  const [fgByEmployee, slackUsers] = await Promise.all([
     fetchAllFGForRange(startStr, endStr),
-    slack.users.list(),
+    fetchSlackUsers(),
   ]);
+  if (!slackUsers) return;
 
-  const slackUsers = slackUsersResp.members;
-  if (!slackUsers) {
-    console.error("No slack users in response");
-    return;
-  }
-
-  for (const row of targets) {
-    const period = periods.get(row.email.toLowerCase());
-    if (!period) continue;
-    const employeeId = period.employee.id;
+  for (const { status, employee, rows, shortfall } of targets) {
     // Per-employee fetch wrapped: a single failure skips just this person.
     let bonusKr: number;
     try {
-      bonusKr = await fetchMonthlyBonus(employeeId, month);
+      bonusKr = await fetchMonthlyBonus(employee.id, month);
     } catch (err) {
-      console.error(`Skipping ${row.email} — fetch failed:`, err);
+      console.error(`Skipping ${status.email} — fetch failed:`, err);
       continue;
     }
-    const fgRange = fgByEmployee.get(employeeId) ?? {
+    const fgRange = fgByEmployee.get(employee.id) ?? {
       billable: 0,
       available: 0,
     };
@@ -2191,7 +1855,7 @@ const notifyMonthlyRecap = async () => {
         ? (fgRange.billable / fgRange.available) * 100
         : null;
 
-    const projects = aggregateProjectHours(period.rows);
+    const projects = aggregateProjectHours(rows);
 
     // Defensive: if FG indicates the employee did register hours but our
     // project query came back empty, something went wrong (404, parse
@@ -2201,57 +1865,34 @@ const notifyMonthlyRecap = async () => {
       (fgRange.billable > 0 || fgRange.available > 0)
     ) {
       console.warn(
-        `Skipping ${row.email}: empty project breakdown despite FG data (${fgRange.billable}/${fgRange.available} t) — likely a fetch failure.`,
+        `Skipping ${status.email}: empty project breakdown despite FG data (${fgRange.billable}/${fgRange.available} t) — likely a fetch failure.`,
       );
       continue;
     }
 
-    const { missingHours, emptyDates } = period.shortfall;
-
-    const targetUser = pickSlackRecipient(slackUsers, row.email);
-    if (!targetUser) {
-      console.error(`No Slack user found for ${row.email}`);
-      continue;
-    }
-
-    const { text, blocks } = buildMonthlyRecapMessage({
-      monthLabel,
-      missingHours,
-      emptyDates,
-      fgPct,
-      billableHours: fgRange.billable,
-      availableHours: fgRange.available,
-      bonusKr,
-      projects,
-    });
-
     console.info(
-      `Monthly recap → @${targetUser.name} (${row.email}) — FG ${fgPct?.toFixed(1) ?? "n/a"} %, bonus ${bonusKr} kr, ${projects.length} prosjekt(er), missing ${formatHours(missingHours)} t, ${emptyDates.length} empty day(s)`,
+      `Monthly recap → ${status.email} — FG ${fgPct?.toFixed(1) ?? "n/a"} %, bonus ${bonusKr} kr, ${projects.length} prosjekt(er), missing ${formatHours(shortfall.missingHours)} t, ${shortfall.emptyDates.length} empty day(s)`,
     );
-
-    if (DRY_RUN) {
-      console.info("DRY_RUN — message preview:\n" + text);
-      continue;
-    }
-
-    try {
-      await slack.chat.postMessage({
-        channel: targetUser.id!,
-        text,
-        blocks: blocks as any,
-        as_user: true,
-      });
-      console.info(`Sent to @${targetUser.name}`);
-    } catch (err) {
-      console.error(`Failed to send to @${targetUser.name}:`, err);
-    }
+    await sendDm(
+      slackUsers,
+      status.email,
+      buildMonthlyRecapMessage({
+        monthLabel: period.label,
+        shortfall,
+        fgPct,
+        billableHours: fgRange.billable,
+        availableHours: fgRange.available,
+        bonusKr,
+        projects,
+      }),
+    );
   }
 };
 
 const main = async () => {
   const tasks: Promise<unknown>[] = [];
   if (isMonday) {
-    tasks.push(notifySlackers());
+    tasks.push(notifySlackers({ withShortfall: !isMonthlyRecap }));
   }
   if (isOvertimeCheck) {
     tasks.push(notifyAdminAboutOvertime());
@@ -2264,9 +1905,7 @@ const main = async () => {
   }
   if (isAdminMissing) {
     const period =
-      adminMissingPeriod === "month"
-        ? lastMonthShortfallPeriod()
-        : lastWeekShortfallPeriod();
+      adminMissingPeriod === "month" ? lastMonthPeriod() : lastWeekPeriod();
     tasks.push(notifyAdminMissingTime(period));
   }
   if (isTuesday) {
@@ -2280,7 +1919,7 @@ const main = async () => {
         "Skipping Tuesday nag — today is also 1st of month, monthly nag covers it.",
       );
     } else {
-      tasks.push(notifyLateRegisterers(lastWeekShortfallPeriod()));
+      tasks.push(notifyLateRegisterers(lastWeekPeriod()));
     }
   }
   if (isFirstOfMonth) {
@@ -2295,7 +1934,7 @@ const main = async () => {
         "Skipping first-of-month nag — today is also first Monday, monthly recap covers it.",
       );
     } else {
-      tasks.push(notifyLateRegisterers(lastMonthShortfallPeriod()));
+      tasks.push(notifyLateRegisterers(lastMonthPeriod()));
     }
   }
   if (isMonthlyRecap) {
