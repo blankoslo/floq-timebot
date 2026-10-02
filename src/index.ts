@@ -397,10 +397,6 @@ async function fetchMonthlyBonus(
 
 // === Per-day breakdown ===
 
-// Floq has no stillingsprosent: business_hours() expects 7.5 h of everyone,
-// and part-time shows up as logged "unavailable" hours. Those count as logged
-// in the per-day breakdown, so its gap is the same as availableHours minus
-// registered hours.
 const STANDARD_WORKDAY_HOURS = 7.5;
 
 // Days outside the employee's employment are "off", like weekends, matching
