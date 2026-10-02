@@ -529,10 +529,7 @@ function shortfallOf(
   const gapByWeek = new Map<string, number>();
   for (const d of days) {
     const w = isoWeekOf(d.date);
-    gapByWeek.set(
-      w,
-      (gapByWeek.get(w) ?? 0) + d.hoursExpected - d.hoursActual,
-    );
+    gapByWeek.set(w, (gapByWeek.get(w) ?? 0) + d.hoursExpected - d.hoursActual);
   }
 
   let gap = 0;
@@ -553,7 +550,9 @@ function shortfallOf(
   return {
     missingHours: Math.max(0, gap - confirmedHours),
     emptyDates: days
-      .filter((d) => d.status === "empty" && !confirmedWeeks.has(isoWeekOf(d.date)))
+      .filter(
+        (d) => d.status === "empty" && !confirmedWeeks.has(isoWeekOf(d.date)),
+      )
       .map((d) => d.date),
     confirmedHours,
   };
@@ -598,13 +597,7 @@ async function loadEmployeePeriods(
   const result = new Map<string, EmployeePeriod>();
   for (const e of employees) {
     const rows = hours.get(e.id) ?? [];
-    const days = buildPerDayBreakdown(
-      startDate,
-      endDate,
-      rows,
-      holidays,
-      e,
-    );
+    const days = buildPerDayBreakdown(startDate, endDate, rows, holidays, e);
     result.set(e.email.toLowerCase(), {
       employee: e,
       rows,
@@ -1609,7 +1602,7 @@ function buildLateRegisterMessage(
       ? `Du mangler fortsatt ${hoursLabel} for *${periodLabel}*. ` +
         `Ser du over og enten bekrefter avspasering eller fører resten? 🙏`
       : `Du mangler fortsatt ${hoursLabel} fordelt på ${daysLabel} for *${periodLabel}*. ` +
-        `Husk at ferie- og permisjonsdager også skal timeføres, og at avspasering bekreftes i timeføringen. ` +
+        `Husk at ferie- og permisjonsdager også skal timeføres, og at avspasering skal bekreftes. ` +
         `Ser du over og evt. fører resten? 🙏`;
 
   const text =
@@ -2055,7 +2048,7 @@ function buildMonthlyRecapMessage(params: {
       : "";
     shortfallLine =
       `Du har ikke ført noen timer på *${formatDatesInMonth(emptyDates)}*.${totalClause} ` +
-      `Husk at ferie- og permisjonsdager også skal timeføres, og at avspasering bekreftes i timeføringen. ` +
+      `Husk at ferie- og permisjonsdager også skal timeføres, og at avspasering skal bekreftes. ` +
       `Ser du over og evt. fører resten? 🙏`;
   } else if (hasMissingHours) {
     shortfallLine =
