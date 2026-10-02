@@ -519,30 +519,41 @@ type Shortfall = {
 const isoWeekOf = (date: string) =>
   moment(date).startOf("isoWeek").format("YYYY-MM-DD");
 
-// A confirmation keeps "holding" after the week's hours are logged after all,
-// with its old minutes, so each week only excuses its own current gap inside
-// the period — never another week's, nor a straddling week's other month.
+// `days` cover whole ISO weeks. A confirmation covers its week's gaps in date
+// order, so two months sharing a week split it the same way whichever runs
+// first, instead of each taking it whole. It is also capped at the week's
+// current gap: it keeps "holding" with its old minutes after the hours are
+// logged after all.
 function shortfallOf(
   days: DayBreakdown[],
+  start: string,
+  end: string,
   confirmedByWeek = new Map<string, number>(),
 ): Shortfall {
-  const gapByWeek = new Map<string, number>();
+  const daysByWeek = new Map<string, DayBreakdown[]>();
   for (const d of days) {
     const w = isoWeekOf(d.date);
-    gapByWeek.set(w, (gapByWeek.get(w) ?? 0) + d.hoursExpected - d.hoursActual);
+    daysByWeek.set(w, [...(daysByWeek.get(w) ?? []), d]);
   }
+  const gapOf = (ds: DayBreakdown[]) =>
+    ds.reduce((sum, d) => sum + d.hoursExpected - d.hoursActual, 0);
+  const inPeriod = (d: DayBreakdown) => d.date >= start && d.date <= end;
 
   let gap = 0;
   let confirmedHours = 0;
   const confirmedWeeks = new Set<string>();
-  for (const [w, weekGap] of gapByWeek) {
-    gap += weekGap;
-    const confirmed = Math.min(
+  for (const [w, weekDays] of daysByWeek) {
+    const insideGap = gapOf(weekDays.filter(inPeriod));
+    const beforeGap = gapOf(weekDays.filter((d) => d.date < start));
+    gap += insideGap;
+    const usable = Math.min(
       confirmedByWeek.get(w) ?? 0,
-      Math.max(0, weekGap),
+      Math.max(0, gapOf(weekDays)),
     );
+    const left = usable - Math.min(usable, Math.max(0, beforeGap));
+    const confirmed = Math.min(left, Math.max(0, insideGap));
     confirmedHours += confirmed;
-    if (confirmed > 0 && confirmed >= weekGap - REPORT_TOLERANCE_HOURS) {
+    if (confirmed > 0 && confirmed >= insideGap - REPORT_TOLERANCE_HOURS) {
       confirmedWeeks.add(w);
     }
   }
@@ -551,7 +562,10 @@ function shortfallOf(
     missingHours: Math.max(0, gap - confirmedHours),
     emptyDates: days
       .filter(
-        (d) => d.status === "empty" && !confirmedWeeks.has(isoWeekOf(d.date)),
+        (d) =>
+          inPeriod(d) &&
+          d.status === "empty" &&
+          !confirmedWeeks.has(isoWeekOf(d.date)),
       )
       .map((d) => d.date),
     confirmedHours,
@@ -573,9 +587,14 @@ async function loadEmployeePeriods(
 ): Promise<Map<string, EmployeePeriod>> {
   const startStr = startDate.format("YYYY-MM-DD");
   const endStr = endDate.format("YYYY-MM-DD");
+  // Whole ISO weeks, so a week straddling the period's edge can be split.
+  const weekStart = startDate.clone().startOf("isoWeek");
+  const weekEnd = endDate.clone().endOf("isoWeek");
+  const weekStartStr = weekStart.format("YYYY-MM-DD");
+  const weekEndStr = weekEnd.format("YYYY-MM-DD");
   const [allEmployees, holidays] = await Promise.all([
     fetchAllEmployees(),
-    fetchHolidays(startStr, endStr),
+    fetchHolidays(weekStartStr, weekEndStr),
   ]);
 
   const byEmail = new Map(allEmployees.map((e) => [e.email.toLowerCase(), e]));
@@ -586,23 +605,25 @@ async function loadEmployeePeriods(
   });
   const ids = employees.map((e) => e.id);
   const [confirmed, hours] = await Promise.all([
-    fetchConfirmedShortfalls(
-      ids,
-      startDate.clone().startOf("isoWeek").format("YYYY-MM-DD"),
-      endStr,
-    ),
-    fetchHoursByEmployee(ids, startStr, endStr),
+    fetchConfirmedShortfalls(ids, weekStartStr, endStr),
+    fetchHoursByEmployee(ids, weekStartStr, weekEndStr),
   ]);
 
   const result = new Map<string, EmployeePeriod>();
   for (const e of employees) {
-    const rows = hours.get(e.id) ?? [];
-    const days = buildPerDayBreakdown(startDate, endDate, rows, holidays, e);
+    const weekRows = hours.get(e.id) ?? [];
+    const weekDays = buildPerDayBreakdown(
+      weekStart,
+      weekEnd,
+      weekRows,
+      holidays,
+      e,
+    );
     result.set(e.email.toLowerCase(), {
       employee: e,
-      rows,
-      days,
-      shortfall: shortfallOf(days, confirmed.get(e.id)),
+      rows: weekRows.filter((r) => r.date >= startStr && r.date <= endStr),
+      days: weekDays.filter((d) => d.date >= startStr && d.date <= endStr),
+      shortfall: shortfallOf(weekDays, startStr, endStr, confirmed.get(e.id)),
     });
   }
   return result;
