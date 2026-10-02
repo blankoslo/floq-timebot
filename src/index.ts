@@ -72,7 +72,6 @@ type TimeTrackingStatusRow = {
   availableHours: number;
   billableHours: number;
   nonBillableHours: number;
-  unregisteredDays: number;
   lastDate: string | null;
 };
 
@@ -120,7 +119,7 @@ type DayStatus =
   | "partial" //   0 < total < 7,5 t
   | "empty" //     0 t
   | "holiday"
-  | "weekend"; //  dropped from display unless work was logged
+  | "off"; //      weekend or not employed, dropped unless work was logged
 
 type DayBreakdown = {
   date: string; // YYYY-MM-DD
@@ -398,65 +397,19 @@ async function fetchMonthlyBonus(
 
 // === Per-day breakdown ===
 
-// Absence-calendar reasons that excuse a workday without registered hours
-// (codes from floq-db's absence_reasons view). Fagutvikling (FAG1000) is left
-// out on purpose
-const EXCUSED_ABSENCE_REASONS = new Set([
-  "AVS", // Avspasering
-  "FER1000", // Ferie
-  "SYK1000",
-  "SYK1001",
-  "SYK1002",
-  "PER1000",
-  "PER1001",
-  "PER1002",
-]);
-
-type ExcusedAbsenceDays = { days: number; dates: Set<string> };
-
-// `days` is percentage-weighted, so a 50 % entry counts as half a day.
-// Only the part not also logged as time on the absence's own project counts:
-// time_tracking_status already takes logged "unavailable" hours out of
-// availableHours, so excusing those again would let each logged ferie day hide
-// a forgotten one. AVS is no project, so it is never logged and always counts.
-function excusedAbsenceByEmployee(
-  absences: AbsenceRow[],
-  hoursByEmployee: Map<number, ProjectHoursPerDayRow[]>,
-): Map<number, ExcusedAbsenceDays> {
-  const loggedHours = new Map<string, number>();
-  for (const rows of hoursByEmployee.values()) {
-    for (const r of rows) {
-      const key = `${r.employeeId}|${r.date}|${r.projectId}`;
-      loggedHours.set(key, (loggedHours.get(key) ?? 0) + r.hours);
-    }
-  }
-
-  const result = new Map<number, ExcusedAbsenceDays>();
-  for (const a of absences) {
-    if (!EXCUSED_ABSENCE_REASONS.has(a.reason)) continue;
-    const day = moment(a.date).day();
-    if (day < 1 || day > 5) continue;
-    const logged =
-      loggedHours.get(`${a.employeeId}|${a.date}|${a.reason}`) ?? 0;
-    const unlogged = a.percentage / 100 - logged / STANDARD_WORKDAY_HOURS;
-    if (unlogged <= 0) continue;
-    const cur = result.get(a.employeeId) ?? { days: 0, dates: new Set() };
-    cur.days += unlogged;
-    cur.dates.add(a.date);
-    result.set(a.employeeId, cur);
-  }
-  return result;
-}
-
 // Standard work day length. Part-timers may see slight noise here; we'll fix
 // that when we surface stillingsprosent properly.
 const STANDARD_WORKDAY_HOURS = 7.5;
 
+// Days outside the employee's employment are "off", like weekends, matching
+// availableHours. The absence calendar is planning, so it plays no part: only
+// logged hours and confirmed avspasering count.
 function buildPerDayBreakdown(
   startDate: moment.Moment,
   endDate: moment.Moment,
   rows: ProjectHoursPerDayRow[],
   holidays: HolidayRow[],
+  employee: EmployeeRow,
 ): DayBreakdown[] {
   // Aggregate per date: absence entries and work entries both count toward
   // "registered time" so e.g. 6 t Permisjon u/lønn shows as ⚠️ partial
@@ -494,6 +447,10 @@ function buildPerDayBreakdown(
 
   const holidayByDate = new Map(holidays.map((h) => [h.date, h.name]));
   const isWeekend = (d: moment.Moment) => d.day() === 0 || d.day() === 6;
+  // Dates are fixed-width YYYY-MM-DD, so string order is date order.
+  const isEmployed = (ds: string) =>
+    (!employee.dateOfEmployment || ds >= employee.dateOfEmployment) &&
+    (!employee.terminationDate || ds <= employee.terminationDate);
 
   // Enumerate all days in the period
   const allDays: moment.Moment[] = [];
@@ -511,15 +468,14 @@ function buildPerDayBreakdown(
     const workHours = agg?.workHours ?? 0;
     const isHoliday = holidayByDate.has(ds);
     const holidayName = holidayByDate.get(ds) ?? undefined;
-    const weekend = isWeekend(d);
 
     let status: DayStatus;
     let hoursExpected: number;
 
-    if (weekend) {
-      // Weekend wins over holiday so weekend-holidays (17. mai on Sunday)
-      // get filtered out rather than surfacing as a row.
-      status = "weekend";
+    if (isWeekend(d) || !isEmployed(ds)) {
+      // Before holiday so weekend-holidays (17. mai on Sunday) get filtered
+      // out rather than surfacing as a row.
+      status = "off";
       hoursExpected = 0;
     } else if (isHoliday) {
       status = "holiday";
@@ -549,8 +505,114 @@ function buildPerDayBreakdown(
     });
   }
 
-  // Drop weekends unless someone registered hours on them
-  return result.filter((d) => d.status !== "weekend" || d.hoursActual > 0);
+  // Drop off days unless someone registered hours on them
+  return result.filter((d) => d.status !== "off" || d.hoursActual > 0);
+}
+
+type Shortfall = {
+  missingHours: number;
+  // Fully empty workdays, except in weeks confirmed as avspasering.
+  emptyDates: string[];
+  confirmedHours: number;
+};
+
+const isoWeekOf = (date: string) =>
+  moment(date).startOf("isoWeek").format("YYYY-MM-DD");
+
+// A confirmation keeps "holding" after the week's hours are logged after all,
+// with its old minutes, so each week only excuses its own current gap inside
+// the period — never another week's, nor a straddling week's other month.
+function shortfallOf(
+  days: DayBreakdown[],
+  confirmedByWeek = new Map<string, number>(),
+): Shortfall {
+  const gapByWeek = new Map<string, number>();
+  for (const d of days) {
+    const w = isoWeekOf(d.date);
+    gapByWeek.set(
+      w,
+      (gapByWeek.get(w) ?? 0) + d.hoursExpected - d.hoursActual,
+    );
+  }
+
+  let gap = 0;
+  let confirmedHours = 0;
+  const confirmedWeeks = new Set<string>();
+  for (const [w, weekGap] of gapByWeek) {
+    gap += weekGap;
+    const confirmed = Math.min(
+      confirmedByWeek.get(w) ?? 0,
+      Math.max(0, weekGap),
+    );
+    confirmedHours += confirmed;
+    if (confirmed > 0 && confirmed >= weekGap - REPORT_TOLERANCE_HOURS) {
+      confirmedWeeks.add(w);
+    }
+  }
+
+  return {
+    missingHours: Math.max(0, gap - confirmedHours),
+    emptyDates: days
+      .filter((d) => d.status === "empty" && !confirmedWeeks.has(isoWeekOf(d.date)))
+      .map((d) => d.date),
+    confirmedHours,
+  };
+}
+
+type EmployeePeriod = {
+  employee: EmployeeRow;
+  rows: ProjectHoursPerDayRow[];
+  days: DayBreakdown[];
+  shortfall: Shortfall;
+};
+
+// Lowercased email → each target's days and shortfall over the period.
+async function loadEmployeePeriods(
+  targets: TimeTrackingStatusRow[],
+  startDate: moment.Moment,
+  endDate: moment.Moment,
+): Promise<Map<string, EmployeePeriod>> {
+  const startStr = startDate.format("YYYY-MM-DD");
+  const endStr = endDate.format("YYYY-MM-DD");
+  const [allEmployees, holidays] = await Promise.all([
+    fetchAllEmployees(),
+    fetchHolidays(startStr, endStr),
+  ]);
+
+  const byEmail = new Map(allEmployees.map((e) => [e.email.toLowerCase(), e]));
+  const employees = targets.flatMap((r) => {
+    const e = byEmail.get(r.email.toLowerCase());
+    if (!e) console.warn(`No employee_id for ${r.email}, skipping`);
+    return e ? [e] : [];
+  });
+  const ids = employees.map((e) => e.id);
+  const [confirmed, hours] = await Promise.all([
+    fetchConfirmedShortfalls(
+      ids,
+      startDate.clone().startOf("isoWeek").format("YYYY-MM-DD"),
+      endStr,
+    ),
+    fetchHoursByEmployee(ids, startStr, endStr),
+  ]);
+
+  const result = new Map<string, EmployeePeriod>();
+  for (const e of employees) {
+    const rows = hours.get(e.id) ?? [];
+    const days = buildPerDayBreakdown(
+      startDate,
+      endDate,
+      rows,
+      holidays,
+      e,
+    );
+    result.set(e.email.toLowerCase(), {
+      employee: e,
+      rows,
+      days,
+      shortfall: shortfallOf(days, confirmed.get(e.id)),
+    });
+  }
+  return result;
 }
 
 // === Formatting ===
@@ -919,11 +981,9 @@ const notifySlackers = async () => {
     return;
   }
 
-  // Fetch shared data once
-  const [holidays, slackUsersResp, allEmployees] = await Promise.all([
-    fetchHolidays(startStr, endStr),
+  const [periods, slackUsersResp] = await Promise.all([
+    loadEmployeePeriods(targets, startDate, endDate),
     slack.users.list(),
-    fetchAllEmployees(),
   ]);
 
   const slackUsers = slackUsersResp.members;
@@ -932,27 +992,10 @@ const notifySlackers = async () => {
     return;
   }
 
-  const idByEmail = new Map(
-    allEmployees.map((e) => [e.email.toLowerCase(), e.id]),
-  );
-  const targetIds = targetEmployeeIds(targets, idByEmail);
-  const [confirmedByEmployee, hoursByEmployee] = await Promise.all([
-    fetchConfirmedShortfallHours(targetIds, startDate, endDate),
-    fetchHoursByEmployee(targetIds, startStr, endStr),
-  ]);
-
   for (const row of targets) {
-    const employeeId = idByEmail.get(row.email.toLowerCase());
-    if (!employeeId) {
-      console.warn(`No employee_id for ${row.email}, skipping`);
-      continue;
-    }
-    const days = buildPerDayBreakdown(
-      startDate,
-      endDate,
-      hoursByEmployee.get(employeeId) ?? [],
-      holidays,
-    );
+    const period = periods.get(row.email.toLowerCase());
+    if (!period) continue;
+    const { days, shortfall } = period;
 
     // Headline totals sum across all surviving days. The filter inside
     // buildPerDayBreakdown already dropped weekends-without-work and other
@@ -970,25 +1013,17 @@ const notifySlackers = async () => {
     // Include shortfall paragraph when there's a gap — except on first-
     // Monday runs, where the monthly recap fires the same day and would
     // duplicate the shortfall info at a wider scope.
-    const hasEmpty = days.some((d) => d.status === "empty");
-    const missing = Math.max(0, totalExpected - totalActual);
-    const hasShortfall = hasEmpty || missing > REPORT_TOLERANCE_HOURS;
-
-    // ...and except when the gap is already confirmed as avspasering. Same
-    // rule as the Tuesday nudge and the admin table (bare >=, so the
-    // confirmation goes stale once the shortfall grows past what was
-    // confirmed) — the > 0 guard keeps a missing-free week from matching a
-    // non-existent confirmation. `missing` is already absence-adjusted:
-    // absence days carry hoursExpected = 0.
-    const confirmedHours = confirmedByEmployee.get(employeeId) ?? 0;
-    const confirmedCoversGap = confirmedHours > 0 && confirmedHours >= missing;
-    if (hasShortfall && confirmedCoversGap) {
+    const hasShortfall =
+      shortfall.emptyDates.length > 0 ||
+      shortfall.missingHours > REPORT_TOLERANCE_HOURS;
+    const confirmedCoversGap = shortfall.confirmedHours > 0 && !hasShortfall;
+    if (confirmedCoversGap) {
       console.info(
-        `${row.email}: dropper shortfall-avsnitt — ${formatHours(missing)} t dekket av ${formatHours(confirmedHours)} t bekreftet avspasering`,
+        `${row.email}: dropper shortfall-avsnitt — gapet er dekket av ${formatHours(shortfall.confirmedHours)} t bekreftet avspasering`,
       );
     }
 
-    const hasIssues = hasShortfall && !isMonthlyRecap && !confirmedCoversGap;
+    const hasIssues = hasShortfall && !isMonthlyRecap;
 
     const { text, blocks } = buildSlackMessage(
       startDate,
@@ -1566,8 +1601,7 @@ function buildLateRegisterMessage(
   const hoursLabel = `*${formatHoursShort(missingHours)} time${missingHours === 1 ? "" : "r"}*`;
   const daysLabel = missingDays === 1 ? "*1 dag*" : `*${missingDays} dager*`;
 
-  // The day count comes from the API's unregisteredDays, which only counts
-  // fully empty workdays. At 0 the gap sits in partial days, more likely
+  // The day count only counts fully empty workdays. At 0 the gap sits in partial days, more likely
   // avspasering than forgotten timeføring, so ask for a confirmation instead
   // (and skip the "fordelt på N dager" clause, which would read "0 dager").
   const message =
@@ -1575,7 +1609,7 @@ function buildLateRegisterMessage(
       ? `Du mangler fortsatt ${hoursLabel} for *${periodLabel}*. ` +
         `Ser du over og enten bekrefter avspasering eller fører resten? 🙏`
       : `Du mangler fortsatt ${hoursLabel} fordelt på ${daysLabel} for *${periodLabel}*. ` +
-        `Husk at avspasering skal markeres i fraværskalender og at ferie- og permisjonsdager også skal timeføres. ` +
+        `Husk at ferie- og permisjonsdager også skal timeføres, og at avspasering bekreftes i timeføringen. ` +
         `Ser du over og evt. fører resten? 🙏`;
 
   const text =
@@ -1637,52 +1671,6 @@ function lastMonthShortfallPeriod(): ShortfallPeriod {
   };
 }
 
-// employee id → hours of avspasering confirmed within the period. Floq stores
-// one balance per week, so a week straddling the period's edge (a month
-// starting mid-week) counts by the share of its Mon–Fri inside it.
-function confirmedShortfallHours(
-  shortfalls: Map<number, Map<string, number>>,
-  startDate: moment.Moment,
-  endDate: moment.Moment,
-): Map<number, number> {
-  const byEmployee = new Map<number, number>();
-  for (const [employeeId, byWeek] of shortfalls) {
-    for (const [weekStart, weekHours] of byWeek) {
-      let weekdaysInPeriod = 0;
-      for (let i = 0; i < 5; i++) {
-        const day = moment(weekStart).add(i, "days");
-        if (day.isBetween(startDate, endDate, "day", "[]")) weekdaysInPeriod++;
-      }
-      const hours = weekHours * (weekdaysInPeriod / 5);
-      byEmployee.set(employeeId, (byEmployee.get(employeeId) ?? 0) + hours);
-    }
-  }
-  return byEmployee;
-}
-
-function targetEmployeeIds(
-  rows: TimeTrackingStatusRow[],
-  idByEmail: Map<string, number>,
-): number[] {
-  return rows.flatMap((r): number[] => {
-    const id = idByEmail.get(r.email.toLowerCase());
-    return id === undefined ? [] : [id];
-  });
-}
-
-async function fetchConfirmedShortfallHours(
-  employeeIds: number[],
-  startDate: moment.Moment,
-  endDate: moment.Moment,
-): Promise<Map<number, number>> {
-  const shortfalls = await fetchConfirmedShortfalls(
-    employeeIds,
-    startDate.clone().startOf("isoWeek").format("YYYY-MM-DD"),
-    endDate.format("YYYY-MM-DD"),
-  );
-  return confirmedShortfallHours(shortfalls, startDate, endDate);
-}
-
 const notifyLateRegisterers = async (period: ShortfallPeriod) => {
   const { startDate, endDate, label: periodLabel, logTag } = period;
   const startStr = startDate.format("YYYY-MM-DD");
@@ -1723,11 +1711,8 @@ const notifyLateRegisterers = async (period: ShortfallPeriod) => {
     return;
   }
 
-  // Fetch absence calendar + employees + slack users in parallel. Bulk
-  // queries instead of per-employee loops.
-  const [allAbsences, allEmployees, slackUsersResp] = await Promise.all([
-    fetchAllAbsencesForWeek(startStr, endStr),
-    fetchAllEmployees(),
+  const [periods, slackUsersResp] = await Promise.all([
+    loadEmployeePeriods(targets, startDate, endDate),
     slack.users.list(),
   ]);
 
@@ -1737,56 +1722,14 @@ const notifyLateRegisterers = async (period: ShortfallPeriod) => {
     return;
   }
 
-  // Build lookup: email → employee_id (lowercased emails)
-  const idByEmail = new Map(
-    allEmployees.map((e) => [e.email.toLowerCase(), e.id]),
-  );
-
-  const targetIds = targetEmployeeIds(targets, idByEmail);
-  const [confirmedByEmployee, hoursByEmployee] = await Promise.all([
-    fetchConfirmedShortfallHours(targetIds, period.startDate, period.endDate),
-    fetchHoursByEmployee(targetIds, startStr, endStr),
-  ]);
-  const excusedAbsence = excusedAbsenceByEmployee(
-    allAbsences,
-    hoursByEmployee,
-  );
-
   for (const row of targets) {
-    const apiMissing =
-      row.availableHours - row.billableHours - row.nonBillableHours;
-
-    const employeeId = idByEmail.get(row.email.toLowerCase());
-    const excusedDays = employeeId ? excusedAbsence.get(employeeId) : undefined;
-    const toleratedByAbsence =
-      (excusedDays?.days ?? 0) * STANDARD_WORKDAY_HOURS;
-
-    // If excused days in the absence calendar fully explain the gap (within
-    // tolerance), skip.
-    if (apiMissing <= toleratedByAbsence + REPORT_TOLERANCE_HOURS) {
+    const shortfall = periods.get(row.email.toLowerCase())?.shortfall;
+    if (!shortfall) continue;
+    const { missingHours, emptyDates, confirmedHours } = shortfall;
+    const missingDays = emptyDates.length;
+    if (missingHours <= REPORT_TOLERANCE_HOURS) {
       console.info(
-        `Skipping ${row.email}: ${formatHours(excusedDays?.days ?? 0)} fraværskalender-dag(er) forklarer gapet på ${formatHours(apiMissing)} t`,
-      );
-      continue;
-    }
-
-    // Subtract the absence-explained portion from both totals shown in the
-    // message so the user sees the remaining real gap.
-    const missingHours = apiMissing - toleratedByAbsence;
-    const missingDays = Math.max(
-      0,
-      row.unregisteredDays - (excusedDays?.dates.size ?? 0),
-    );
-
-    // The user has already owned up to this week as avspasering, so don't nag
-    // about it. Bare >= is Floq's own isBalanceConfirmed rule: the
-    // confirmation goes stale once the shortfall grows past what was confirmed.
-    const confirmed = employeeId
-      ? (confirmedByEmployee.get(employeeId) ?? 0)
-      : 0;
-    if (confirmed >= missingHours) {
-      console.info(
-        `Skipping ${row.email}: ${formatHours(missingHours)} t dekket av ${formatHours(confirmed)} t bekreftet avspasering`,
+        `Skipping ${row.email}: ${formatHours(confirmedHours)} t bekreftet avspasering dekker gapet`,
       );
       continue;
     }
@@ -1804,7 +1747,7 @@ const notifyLateRegisterers = async (period: ShortfallPeriod) => {
     );
 
     console.info(
-      `Nudging @${targetUser.name} (${row.email}) — still missing ${formatHours(missingHours)} t, ${missingDays} empty day(s) (after ${formatHours(excusedDays?.days ?? 0)} absence-cal day(s) tolerance)`,
+      `Nudging @${targetUser.name} (${row.email}) — still missing ${formatHours(missingHours)} t, ${missingDays} empty day(s)`,
     );
 
     if (DRY_RUN) {
@@ -1829,12 +1772,9 @@ const notifyLateRegisterers = async (period: ShortfallPeriod) => {
 // === Admin: aggregert oversikt over manglende timeføring ===
 //
 // A single table posted to the bemanning/salg channel listing who still has a
-// *real* shortfall for the period — i.e. after subtracting excused days in the
-// absence calendar, so people on ferie don't clutter the list. Rides along with
-// the Monday/Tuesday/first-of-month triggers as an admin's-eye companion to the
-// personal DMs.
-//
-// Honours confirmed avspasering on the same terms as the personal nudge.
+// shortfall for the period, after confirmed avspasering, on the same terms as
+// the personal nudge. Rides along with the Monday/Tuesday/first-of-month
+// triggers as an admin's-eye companion to the personal DMs.
 
 type MissingTimeRow = {
   name: string;
@@ -1929,56 +1869,18 @@ const notifyAdminMissingTime = async (period: ShortfallPeriod) => {
     return registered < r.availableHours - REPORT_TOLERANCE_HOURS;
   });
 
-  // Excused days in the absence calendar explain part of a gap.
-  const [allAbsences, allEmployees] = await Promise.all([
-    fetchAllAbsencesForWeek(startStr, endStr),
-    fetchAllEmployees(),
-  ]);
-  const idByEmail = new Map(
-    allEmployees.map((e) => [e.email.toLowerCase(), e.id]),
-  );
-  const candidateIds = targetEmployeeIds(candidates, idByEmail);
-  const [confirmedByEmployee, hoursByEmployee] = await Promise.all([
-    fetchConfirmedShortfallHours(
-      candidateIds,
-      period.startDate,
-      period.endDate,
-    ),
-    fetchHoursByEmployee(candidateIds, startStr, endStr),
-  ]);
-  const excusedAbsence = excusedAbsenceByEmployee(
-    allAbsences,
-    hoursByEmployee,
-  );
+  const periods = await loadEmployeePeriods(candidates, startDate, endDate);
 
   const missingRows: MissingTimeRow[] = [];
   for (const row of candidates) {
-    const apiMissing =
-      row.availableHours - row.billableHours - row.nonBillableHours;
-    const employeeId = idByEmail.get(row.email.toLowerCase());
-    const excusedDays = employeeId
-      ? (excusedAbsence.get(employeeId)?.days ?? 0)
-      : 0;
-    const realMissing = apiMissing - excusedDays * STANDARD_WORKDAY_HOURS;
-    if (realMissing <= REPORT_TOLERANCE_HOURS) continue; // explained by absence
-
-    // Same rule as the personal nudge, so the two lists agree: bare >= is
-    // Floq's own isBalanceConfirmed, and the confirmation goes stale once the
-    // shortfall grows past what was confirmed.
-    const confirmed = employeeId
-      ? (confirmedByEmployee.get(employeeId) ?? 0)
-      : 0;
-    if (confirmed >= realMissing) {
-      console.info(
-        `Skipping ${row.email}: ${formatHours(realMissing)} t dekket av ${formatHours(confirmed)} t bekreftet avspasering`,
-      );
-      continue;
-    }
+    const missingHours =
+      periods.get(row.email.toLowerCase())?.shortfall.missingHours ?? 0;
+    if (missingHours <= REPORT_TOLERANCE_HOURS) continue;
 
     missingRows.push({
       name: row.name,
       lastDate: row.lastDate,
-      missingHours: realMissing,
+      missingHours,
     });
   }
 
@@ -2153,7 +2055,7 @@ function buildMonthlyRecapMessage(params: {
       : "";
     shortfallLine =
       `Du har ikke ført noen timer på *${formatDatesInMonth(emptyDates)}*.${totalClause} ` +
-      `Husk at avspasering skal markeres i fraværskalender og at ferie- og permisjonsdager også skal timeføres. ` +
+      `Husk at ferie- og permisjonsdager også skal timeføres, og at avspasering bekreftes i timeføringen. ` +
       `Ser du over og evt. fører resten? 🙏`;
   } else if (hasMissingHours) {
     shortfallLine =
@@ -2264,13 +2166,11 @@ const notifyMonthlyRecap = async () => {
     return;
   }
 
-  const [allEmployees, allAbsences, holidays, slackUsersResp] =
-    await Promise.all([
-      fetchAllEmployees(),
-      fetchAllAbsencesForWeek(startStr, endStr),
-      fetchHolidays(startStr, endStr),
-      slack.users.list(),
-    ]);
+  const [periods, fgByEmployee, slackUsersResp] = await Promise.all([
+    loadEmployeePeriods(targets, monthStart, monthEnd),
+    fetchAllFGForRange(startStr, endStr),
+    slack.users.list(),
+  ]);
 
   const slackUsers = slackUsersResp.members;
   if (!slackUsers) {
@@ -2278,40 +2178,10 @@ const notifyMonthlyRecap = async () => {
     return;
   }
 
-  const idByEmail = new Map(
-    allEmployees.map((e) => [e.email.toLowerCase(), e.id]),
-  );
-
-  // Weeks the employee has confirmed as avspasering, so their empty days
-  // aren't named as forgotten.
-  const targetIds = targetEmployeeIds(targets, idByEmail);
-  const [confirmedShortfalls, hoursByEmployee, fgByEmployee] =
-    await Promise.all([
-      fetchConfirmedShortfalls(
-        targetIds,
-        monthStart.clone().startOf("isoWeek").format("YYYY-MM-DD"),
-        endStr,
-      ),
-      fetchHoursByEmployee(targetIds, startStr, endStr),
-      fetchAllFGForRange(startStr, endStr),
-    ]);
-  const confirmedByEmployee = confirmedShortfallHours(
-    confirmedShortfalls,
-    monthStart,
-    monthEnd,
-  );
-  const excusedAbsence = excusedAbsenceByEmployee(
-    allAbsences,
-    hoursByEmployee,
-  );
-
   for (const row of targets) {
-    const employeeId = idByEmail.get(row.email.toLowerCase());
-    if (!employeeId) {
-      console.warn(`No employee_id for ${row.email}, skipping`);
-      continue;
-    }
-    const projectRows = hoursByEmployee.get(employeeId) ?? [];
+    const period = periods.get(row.email.toLowerCase());
+    if (!period) continue;
+    const employeeId = period.employee.id;
     // Per-employee fetch wrapped: a single failure skips just this person.
     let bonusKr: number;
     try {
@@ -2329,7 +2199,7 @@ const notifyMonthlyRecap = async () => {
         ? (fgRange.billable / fgRange.available) * 100
         : null;
 
-    const projects = aggregateProjectHours(projectRows);
+    const projects = aggregateProjectHours(period.rows);
 
     // Defensive: if FG indicates the employee did register hours but our
     // project query came back empty, something went wrong (404, parse
@@ -2344,40 +2214,7 @@ const notifyMonthlyRecap = async () => {
       continue;
     }
 
-    // Shortfall: same logic as Tuesday, with absence-calendar tolerance
-    const apiMissing =
-      row.availableHours - row.billableHours - row.nonBillableHours;
-    const excusedDays = excusedAbsence.get(employeeId);
-    const toleratedByAbsence =
-      (excusedDays?.days ?? 0) * STANDARD_WORKDAY_HOURS;
-
-    const excusedDates = excusedDays?.dates ?? new Set();
-    const confirmedWeeks = new Set(
-      confirmedShortfalls.get(employeeId)?.keys() ?? [],
-    );
-    const emptyDays = buildPerDayBreakdown(
-      monthStart,
-      monthEnd,
-      projectRows,
-      holidays,
-    ).filter((d) => d.status === "empty" && !excusedDates.has(d.date));
-    const emptyDates = emptyDays
-      .filter(
-        (d) =>
-          !confirmedWeeks.has(
-            moment(d.date).startOf("isoWeek").format("YYYY-MM-DD"),
-          ),
-      )
-      .map((d) => d.date);
-
-    // Confirmed hours, not confirmed empty days: avspasering taken as shorter
-    // days leaves no day empty.
-    const realMissing = Math.max(
-      0,
-      apiMissing -
-        toleratedByAbsence -
-        (confirmedByEmployee.get(employeeId) ?? 0),
-    );
+    const { missingHours, emptyDates } = period.shortfall;
 
     const targetUser = pickSlackRecipient(slackUsers, row.email);
     if (!targetUser) {
@@ -2387,7 +2224,7 @@ const notifyMonthlyRecap = async () => {
 
     const { text, blocks } = buildMonthlyRecapMessage({
       monthLabel,
-      missingHours: realMissing,
+      missingHours,
       emptyDates,
       fgPct,
       billableHours: fgRange.billable,
@@ -2397,7 +2234,7 @@ const notifyMonthlyRecap = async () => {
     });
 
     console.info(
-      `Monthly recap → @${targetUser.name} (${row.email}) — FG ${fgPct?.toFixed(1) ?? "n/a"} %, bonus ${bonusKr} kr, ${projects.length} prosjekt(er), missing ${formatHours(realMissing)} t, ${emptyDates.length} empty day(s)`,
+      `Monthly recap → @${targetUser.name} (${row.email}) — FG ${fgPct?.toFixed(1) ?? "n/a"} %, bonus ${bonusKr} kr, ${projects.length} prosjekt(er), missing ${formatHours(missingHours)} t, ${emptyDates.length} empty day(s)`,
     );
 
     if (DRY_RUN) {
