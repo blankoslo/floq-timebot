@@ -1,9 +1,9 @@
 import moment from "moment";
-import { CAPACITY_CHANNEL } from "../config.js";
+import { CAPACITY_CHANNEL, REPORT_TOLERANCE_HOURS } from "../config.js";
 import { SlackMessage, headerCell, postMessage, textCell } from "../slack.js";
 import { ReportPeriod } from "../periods.js";
 import { formatHours, formatHoursShort } from "../format.js";
-import { hasShortfall, loadPeriodTargets } from "../shortfall.js";
+import { loadPeriodTargets } from "../shortfall.js";
 
 // A single table posted to the bemanning/salg channel listing who still has a
 // shortfall for the period, after confirmed avspasering, on the same terms as
@@ -14,7 +14,6 @@ type MissingTimeRow = {
   name: string;
   lastDate: string | null;
   missingHours: number;
-  emptyDays: number;
 };
 
 function buildAdminMissingMessage(
@@ -31,13 +30,6 @@ function buildAdminMissingMessage(
 
   const fmtDate = (d: string | null) =>
     d ? moment(d).format("D. MMM YYYY") : "aldri";
-  // A net total can be covered while a whole day is still empty, which is
-  // why that person is listed at all.
-  const fmtMissing = (r: MissingTimeRow) =>
-    `${formatHours(r.missingHours)} t` +
-    (r.emptyDays > 0
-      ? ` (${r.emptyDays} ${r.emptyDays === 1 ? "dag" : "dager"} uten timer)`
-      : "");
 
   const totalMissing = rows.reduce((s, r) => s + r.missingHours, 0);
   const introLine = `*Manglende timeføring for ${periodLabel}*`;
@@ -50,7 +42,7 @@ function buildAdminMissingMessage(
     "",
     ...rows.map(
       (r) =>
-        `${r.name} — sist ført ${fmtDate(r.lastDate)} — mangler ${fmtMissing(r)}`,
+        `${r.name} — sist ført ${fmtDate(r.lastDate)} — mangler ${formatHours(r.missingHours)} t`,
     ),
   ];
   const text = textLines.join("\n");
@@ -63,7 +55,7 @@ function buildAdminMissingMessage(
   const dataRows = rows.map((r) => [
     textCell(r.name),
     textCell(fmtDate(r.lastDate)),
-    textCell(fmtMissing(r)),
+    textCell(`${formatHours(r.missingHours)} t`),
   ]);
 
   const blocks: Array<Record<string, unknown>> = [
@@ -88,12 +80,11 @@ export const notifyAdminMissingTime = async (period: ReportPeriod) => {
 
   const targets = await loadPeriodTargets(period, { testUserOnly: false });
   const missingRows: MissingTimeRow[] = targets
-    .filter((t) => hasShortfall(t.shortfall))
+    .filter((t) => t.shortfall.missingHours > REPORT_TOLERANCE_HOURS)
     .map((t) => ({
       name: t.status.name,
       lastDate: t.status.lastDate,
       missingHours: t.shortfall.missingHours,
-      emptyDays: t.shortfall.emptyDates.length,
     }))
     // Biggest gaps first; ties by name.
     .sort(
@@ -102,7 +93,7 @@ export const notifyAdminMissingTime = async (period: ReportPeriod) => {
     );
 
   console.info(
-    `Admin missing-time: ${missingRows.length} with a shortfall for ${period.label}`,
+    `Admin missing-time: ${missingRows.length} with a real shortfall for ${period.label}`,
   );
   await postMessage(
     `#${CAPACITY_CHANNEL}`,

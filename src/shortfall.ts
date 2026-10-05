@@ -131,7 +131,9 @@ function buildPerDayBreakdown(
 
 export type Shortfall = {
   missingHours: number;
-  // Fully empty workdays, except in weeks confirmed as avspasering.
+  // Fully empty workdays, except in weeks confirmed as avspasering. Empty
+  // when the period's total is covered: enough hours means nothing was
+  // forgotten, whichever day they went on.
   emptyDates: string[];
   confirmedHours: number;
 };
@@ -161,11 +163,15 @@ function shortfallOf(
     0,
   );
 
+  const missingHours = Math.max(0, gap - confirmedHours);
   return {
-    missingHours: Math.max(0, gap - confirmedHours),
-    emptyDates: days
-      .filter((d) => d.status === "empty" && !isConfirmed(d))
-      .map((d) => d.date),
+    missingHours,
+    emptyDates:
+      missingHours > REPORT_TOLERANCE_HOURS
+        ? days
+            .filter((d) => d.status === "empty" && !isConfirmed(d))
+            .map((d) => d.date)
+        : [],
     confirmedHours,
   };
 }
@@ -221,8 +227,8 @@ async function loadEmployeePeriods(
   return result;
 }
 
-export const hasShortfall = ({ missingHours, emptyDates }: Shortfall) =>
-  emptyDates.length > 0 || missingHours > REPORT_TOLERANCE_HOURS;
+export const hasShortfall = ({ missingHours }: Shortfall) =>
+  missingHours > REPORT_TOLERANCE_HOURS;
 
 type PeriodTarget = EmployeePeriod & { status: TimeTrackingStatusRow };
 
@@ -249,9 +255,9 @@ export async function loadPeriodTargets(
   });
 }
 
-// Fully empty days are named explicitly: the net total alone can hide them
-// (7,5 t missing on one day minus 1,5 t extra elsewhere read as "6 timer
-// fordelt på 1 dag"). A gap only in partial days is more likely avspasering,
+// Fully empty days are named alongside the total: the total alone can hide
+// them (7,5 t missing on one day minus 1,5 t extra elsewhere read as "6
+// timer"). A gap only in partial days is more likely avspasering,
 // so that one asks for a confirmation instead.
 export function shortfallSentence(
   { missingHours, emptyDates }: Shortfall,
@@ -264,17 +270,13 @@ export function shortfallSentence(
       `Ser du over og enten bekrefter avspasering eller fører resten? 🙏`
     );
   }
-  const totalClause =
-    missingHours > REPORT_TOLERANCE_HOURS
-      ? ` Totalt for *${periodLabel}* mangler du ${hoursLabel}.`
-      : "";
   // Past a handful, a list of dates is harder to read than the count.
   const emptyClause =
     emptyDates.length > 5
       ? `Du har *${emptyDates.length} dager* uten timer.`
       : `Du har ikke ført noen timer på *${formatDates(emptyDates)}*.`;
   return (
-    `${emptyClause}${totalClause} ` +
+    `${emptyClause} Totalt for *${periodLabel}* mangler du ${hoursLabel}. ` +
     `Husk at ferie- og permisjonsdager også skal timeføres, og at avspasering skal bekreftes. ` +
     `Ser du over og evt. fører resten? 🙏`
   );
