@@ -131,7 +131,9 @@ function buildPerDayBreakdown(
 
 export type Shortfall = {
   missingHours: number;
-  // Fully empty workdays, except in weeks confirmed as avspasering.
+  // Fully empty workdays, except in weeks confirmed as avspasering. Empty
+  // when the period's total is covered: enough hours means nothing was
+  // forgotten, whichever day they went on.
   emptyDates: string[];
   confirmedHours: number;
 };
@@ -139,50 +141,37 @@ export type Shortfall = {
 const isoWeekOf = (date: string) =>
   moment(date).startOf("isoWeek").format("YYYY-MM-DD");
 
-// `days` cover whole ISO weeks. A confirmed week's gap is covered in date
-// order, so two months sharing a week split it the same way whichever runs
-// first, instead of each taking it whole.
+// A confirmed week's gap is excused whichever month its days fall in: the
+// person has already said it was avspasering, so neither month should ask
+// again. Extra hours in a confirmed week still count toward the rest.
 function shortfallOf(
   days: DayBreakdown[],
-  start: string,
-  end: string,
   confirmedWeeks = new Set<string>(),
 ): Shortfall {
-  const daysByWeek = new Map<string, DayBreakdown[]>();
-  for (const d of days) {
+  const isConfirmed = (d: DayBreakdown) =>
+    confirmedWeeks.has(isoWeekOf(d.date));
+  const gapOf = (d: DayBreakdown) => d.hoursExpected - d.hoursActual;
+
+  const gap = days.reduce((sum, d) => sum + gapOf(d), 0);
+  const gapByWeek = new Map<string, number>();
+  for (const d of days.filter(isConfirmed)) {
     const w = isoWeekOf(d.date);
-    daysByWeek.set(w, [...(daysByWeek.get(w) ?? []), d]);
+    gapByWeek.set(w, (gapByWeek.get(w) ?? 0) + gapOf(d));
   }
-  const gapOf = (ds: DayBreakdown[]) =>
-    ds.reduce((sum, d) => sum + d.hoursExpected - d.hoursActual, 0);
-  const inPeriod = (d: DayBreakdown) => d.date >= start && d.date <= end;
+  const confirmedHours = [...gapByWeek.values()].reduce(
+    (sum, g) => sum + Math.max(0, g),
+    0,
+  );
 
-  let gap = 0;
-  let confirmedHours = 0;
-  const coveredWeeks = new Set<string>();
-  for (const [w, weekDays] of daysByWeek) {
-    const insideGap = gapOf(weekDays.filter(inPeriod));
-    const beforeGap = gapOf(weekDays.filter((d) => d.date < start));
-    gap += insideGap;
-    const usable = confirmedWeeks.has(w) ? Math.max(0, gapOf(weekDays)) : 0;
-    const left = usable - Math.min(usable, Math.max(0, beforeGap));
-    const confirmed = Math.min(left, Math.max(0, insideGap));
-    confirmedHours += confirmed;
-    if (confirmed > 0 && confirmed >= insideGap - REPORT_TOLERANCE_HOURS) {
-      coveredWeeks.add(w);
-    }
-  }
-
+  const missingHours = Math.max(0, gap - confirmedHours);
   return {
-    missingHours: Math.max(0, gap - confirmedHours),
-    emptyDates: days
-      .filter(
-        (d) =>
-          inPeriod(d) &&
-          d.status === "empty" &&
-          !coveredWeeks.has(isoWeekOf(d.date)),
-      )
-      .map((d) => d.date),
+    missingHours,
+    emptyDates:
+      missingHours > REPORT_TOLERANCE_HOURS
+        ? days
+            .filter((d) => d.status === "empty" && !isConfirmed(d))
+            .map((d) => d.date)
+        : [],
     confirmedHours,
   };
 }
@@ -202,14 +191,9 @@ async function loadEmployeePeriods(
 ): Promise<Map<string, EmployeePeriod>> {
   const startStr = startDate.format("YYYY-MM-DD");
   const endStr = endDate.format("YYYY-MM-DD");
-  // Whole ISO weeks, so a week straddling the period's edge can be split.
-  const weekStart = startDate.clone().startOf("isoWeek");
-  const weekEnd = endDate.clone().endOf("isoWeek");
-  const weekStartStr = weekStart.format("YYYY-MM-DD");
-  const weekEndStr = weekEnd.format("YYYY-MM-DD");
   const [allEmployees, holidays] = await Promise.all([
     fetchAllEmployees(),
-    fetchHolidays(weekStartStr, weekEndStr),
+    fetchHolidays(startStr, endStr),
   ]);
 
   const byEmail = new Map(allEmployees.map((e) => [e.email.toLowerCase(), e]));
@@ -220,32 +204,31 @@ async function loadEmployeePeriods(
   });
   const ids = employees.map((e) => e.id);
   const [confirmed, hours] = await Promise.all([
-    fetchConfirmedWeeks(ids, weekStartStr, endStr),
-    fetchHoursByEmployee(ids, weekStartStr, weekEndStr),
+    // Confirmations are keyed by Monday, which may fall before the period.
+    fetchConfirmedWeeks(
+      ids,
+      startDate.clone().startOf("isoWeek").format("YYYY-MM-DD"),
+      endStr,
+    ),
+    fetchHoursByEmployee(ids, startStr, endStr),
   ]);
 
   const result = new Map<string, EmployeePeriod>();
   for (const e of employees) {
-    const weekRows = hours.get(e.id) ?? [];
-    const weekDays = buildPerDayBreakdown(
-      weekStart,
-      weekEnd,
-      weekRows,
-      holidays,
-      e,
-    );
+    const rows = hours.get(e.id) ?? [];
+    const days = buildPerDayBreakdown(startDate, endDate, rows, holidays, e);
     result.set(e.email.toLowerCase(), {
       employee: e,
-      rows: weekRows.filter((r) => r.date >= startStr && r.date <= endStr),
-      days: weekDays.filter((d) => d.date >= startStr && d.date <= endStr),
-      shortfall: shortfallOf(weekDays, startStr, endStr, confirmed.get(e.id)),
+      rows,
+      days,
+      shortfall: shortfallOf(days, confirmed.get(e.id)),
     });
   }
   return result;
 }
 
-export const hasShortfall = ({ missingHours, emptyDates }: Shortfall) =>
-  emptyDates.length > 0 || missingHours > REPORT_TOLERANCE_HOURS;
+export const hasShortfall = ({ missingHours }: Shortfall) =>
+  missingHours > REPORT_TOLERANCE_HOURS;
 
 type PeriodTarget = EmployeePeriod & { status: TimeTrackingStatusRow };
 
@@ -272,9 +255,9 @@ export async function loadPeriodTargets(
   });
 }
 
-// Fully empty days are named explicitly: the net total alone can hide them
-// (7,5 t missing on one day minus 1,5 t extra elsewhere read as "6 timer
-// fordelt på 1 dag"). A gap only in partial days is more likely avspasering,
+// Fully empty days are named alongside the total: the total alone can hide
+// them (7,5 t missing on one day minus 1,5 t extra elsewhere read as "6
+// timer"). A gap only in partial days is more likely avspasering,
 // so that one asks for a confirmation instead.
 export function shortfallSentence(
   { missingHours, emptyDates }: Shortfall,
@@ -287,17 +270,13 @@ export function shortfallSentence(
       `Ser du over og enten bekrefter avspasering eller fører resten? 🙏`
     );
   }
-  const totalClause =
-    missingHours > REPORT_TOLERANCE_HOURS
-      ? ` Totalt for *${periodLabel}* mangler du ${hoursLabel}.`
-      : "";
   // Past a handful, a list of dates is harder to read than the count.
   const emptyClause =
     emptyDates.length > 5
       ? `Du har *${emptyDates.length} dager* uten timer.`
       : `Du har ikke ført noen timer på *${formatDates(emptyDates)}*.`;
   return (
-    `${emptyClause}${totalClause} ` +
+    `${emptyClause} Totalt for *${periodLabel}* mangler du ${hoursLabel}. ` +
     `Husk at ferie- og permisjonsdager også skal timeføres, og at avspasering skal bekreftes. ` +
     `Ser du over og evt. fører resten? 🙏`
   );

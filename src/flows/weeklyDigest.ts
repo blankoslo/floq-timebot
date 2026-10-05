@@ -1,6 +1,6 @@
 import moment from "moment";
 import { FLOQ_TIMESTAMP_URL } from "../config.js";
-import { DayBreakdown, DayStatus } from "../types.js";
+import { DayBreakdown } from "../types.js";
 import {
   SlackMessage,
   fetchSlackUsers,
@@ -17,6 +17,8 @@ import {
   shortfallSentence,
 } from "../shortfall.js";
 
+const FULL_WEEK_HOURS = 37.5;
+
 // Full Norwegian weekday names, used in the table view.
 const DAY_NAMES_NB = [
   "Søndag",
@@ -28,14 +30,15 @@ const DAY_NAMES_NB = [
   "Lørdag",
 ];
 
-function statusIcon(s: DayStatus, gapConfirmed = false): string {
+function statusIcon(day: DayBreakdown, hidden: Set<string>): string {
+  if (hidden.has(day.date)) return "";
   // Per design: only flag days that warrant attention. Complete days and
   // absence days don't need a visual marker — the row already conveys it.
-  switch (s) {
+  switch (day.status) {
     case "partial":
-      return gapConfirmed ? "" : "⚠️";
+      return "⚠️";
     case "empty":
-      return gapConfirmed ? "" : "⛔️";
+      return "⛔️";
     case "holiday":
       return "🗓️";
     default:
@@ -45,11 +48,11 @@ function statusIcon(s: DayStatus, gapConfirmed = false): string {
 
 function buildTableRow(
   day: DayBreakdown,
-  gapConfirmed = false,
+  hidden: Set<string>,
 ): Record<string, unknown>[] {
   const m = moment(day.date);
   const dayDateLabel = `${DAY_NAMES_NB[m.day()]} ${m.format("D. MMMM")}`;
-  const icon = statusIcon(day.status, gapConfirmed);
+  const icon = statusIcon(day, hidden);
   const hoursStr = `${formatHours(day.hoursActual)} t`;
 
   if (day.status === "holiday") {
@@ -112,7 +115,7 @@ function buildTableBlock(
   days: DayBreakdown[],
   totalActual: number,
   totalExpected: number,
-  gapConfirmed = false,
+  hidden: Set<string>,
 ): Record<string, unknown> {
   const headerRow = [
     headerCell("Dag"),
@@ -120,7 +123,7 @@ function buildTableBlock(
     headerCell("Prosjekt"),
     headerCell("Status"),
   ];
-  const dataRows = days.map((d) => buildTableRow(d, gapConfirmed));
+  const dataRows = days.map((d) => buildTableRow(d, hidden));
   const totalRow = [
     headerCell("Totalt"),
     headerCell(`${formatHours(totalActual)} t`),
@@ -140,7 +143,7 @@ function buildTableBlock(
   };
 }
 
-function formatPerDayLine(day: DayBreakdown, gapConfirmed = false): string {
+function formatPerDayLine(day: DayBreakdown, hidden: Set<string>): string {
   // The day is implicit from row order (Mon–Fri matches the period in the
   // headline), so we skip the prefix entirely. This sidesteps the alignment
   // problem entirely and keeps each row to its essentials.
@@ -163,7 +166,7 @@ function formatPerDayLine(day: DayBreakdown, gapConfirmed = false): string {
   const hoursStr = formatHours(day.hoursActual);
 
   if (day.status === "empty") {
-    return `${hoursStr} t ${statusIcon(day.status, gapConfirmed)}`.trimEnd();
+    return `${hoursStr} t ${statusIcon(day, hidden)}`.trimEnd();
   }
 
   // complete or partial — show hours and project(s)
@@ -173,7 +176,7 @@ function formatPerDayLine(day: DayBreakdown, gapConfirmed = false): string {
         (day.projects.length > 3 ? " m.fl." : "")
       : "-";
   const base = `${hoursStr} t (${projectStr})`;
-  const icon = statusIcon(day.status, gapConfirmed);
+  const icon = statusIcon(day, hidden);
   return icon ? `${base} ${icon}` : base;
 }
 
@@ -183,11 +186,9 @@ function buildSlackMessage(
   totalActual: number,
   totalExpected: number,
   shortfallLine: string | null,
-  gapConfirmed = false,
+  hidden: Set<string>,
 ): SlackMessage {
-  const perDayLines = days
-    .map((d) => formatPerDayLine(d, gapConfirmed))
-    .join("\n");
+  const perDayLines = days.map((d) => formatPerDayLine(d, hidden)).join("\n");
 
   const baseIntro = `Her er en oversikt over timene dine for *${periodLabel}*.`;
   const introLine = shortfallLine ? `${baseIntro} ${shortfallLine}` : baseIntro;
@@ -208,7 +209,7 @@ function buildSlackMessage(
   const blocks: Array<Record<string, unknown>> = [
     { type: "section", text: { type: "mrkdwn", text: introLine } },
     timestampButton(),
-    buildTableBlock(days, totalActual, totalExpected, gapConfirmed),
+    buildTableBlock(days, totalActual, totalExpected, hidden),
   ];
 
   return { text, blocks };
@@ -237,6 +238,17 @@ export const notifySlackers = async ({
     const totalExpected = days.reduce((s, d) => s + d.hoursExpected, 0);
     const confirmedCoversGap =
       shortfall.confirmedHours > 0 && !hasShortfall(shortfall);
+    // ⛔️ marks exactly the days the shortfall sentence names, so the table
+    // and the text can't disagree.
+    const flaggedEmpty = new Set(shortfall.emptyDates);
+    const hidePartial = confirmedCoversGap || totalActual >= FULL_WEEK_HOURS;
+    const hidden = new Set(
+      days
+        .filter((d) =>
+          d.status === "empty" ? !flaggedEmpty.has(d.date) : hidePartial,
+        )
+        .map((d) => d.date),
+    );
     const shortfallLine =
       withShortfall && hasShortfall(shortfall)
         ? shortfallSentence(shortfall, period.label)
@@ -254,7 +266,7 @@ export const notifySlackers = async ({
         totalActual,
         totalExpected,
         shortfallLine,
-        confirmedCoversGap,
+        hidden,
       ),
     );
   }
