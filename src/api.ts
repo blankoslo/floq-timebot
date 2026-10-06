@@ -134,7 +134,7 @@ export async function fetchConfirmedWeeks(
   if (employeeIds.length === 0) return result;
 
   const weeks = await apiGet<{ employeeId: number; weekStart: string }[]>(
-    `/timesheet/confirmed-weeks?employeeIds=${employeeIds.join(",")}&from=${fromMonday}&to=${toDate}`,
+    `/timesheet/balance-confirmations?employeeIds=${employeeIds.join(",")}&from=${fromMonday}&to=${toDate}`,
   );
   for (const w of weeks) {
     const byEmployee = result.get(w.employeeId) ?? new Set<string>();
