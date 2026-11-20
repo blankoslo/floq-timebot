@@ -115,6 +115,7 @@ function buildTableBlock(
   days: DayBreakdown[],
   totalActual: number,
   totalExpected: number,
+  billableHours: number,
   hidden: Set<string>,
 ): Record<string, unknown> {
   const headerRow = [
@@ -130,6 +131,13 @@ function buildTableBlock(
     headerCell(`av ${formatHoursShort(totalExpected)} t`),
     textCell(""),
   ];
+  // Part of the total above, lined up under it in the Timer column.
+  const billableRow = [
+    headerCell("Fakturerbart"),
+    headerCell(`${formatHours(billableHours)} t`),
+    textCell(""),
+    textCell(""),
+  ];
 
   return {
     type: "table",
@@ -139,7 +147,13 @@ function buildTableBlock(
       { align: "left", is_wrapped: true }, // Prosjekt
       { align: "center" }, // Status
     ],
-    rows: [headerRow, ...dataRows, totalRow],
+    rows: [
+      headerRow,
+      ...dataRows,
+      totalRow,
+      // Left out when nothing was billable, e.g. for those who never bill.
+      ...(billableHours > 0 ? [billableRow] : []),
+    ],
   };
 }
 
@@ -185,6 +199,7 @@ function buildSlackMessage(
   days: DayBreakdown[],
   totalActual: number,
   totalExpected: number,
+  billableHours: number,
   shortfallLine: string | null,
   hidden: Set<string>,
 ): SlackMessage {
@@ -209,7 +224,7 @@ function buildSlackMessage(
   const blocks: Array<Record<string, unknown>> = [
     { type: "section", text: { type: "mrkdwn", text: introLine } },
     timestampButton(),
-    buildTableBlock(days, totalActual, totalExpected, hidden),
+    buildTableBlock(days, totalActual, totalExpected, billableHours, hidden),
   ];
 
   return { text, blocks };
@@ -265,6 +280,7 @@ export const notifySlackers = async ({
         days,
         totalActual,
         totalExpected,
+        status.billableHours,
         shortfallLine,
         hidden,
       ),

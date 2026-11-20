@@ -47,7 +47,10 @@ export async function postMessage(
   { text, blocks }: SlackMessage,
 ): Promise<void> {
   if (DRY_RUN) {
-    console.info(`DRY_RUN — preview for ${recipient}:\n${text}`);
+    // Preview the blocks, since that's what Slack shows; `text` is only the
+    // notification fallback.
+    const preview = blocks ? previewBlocks(blocks) : text;
+    console.info(`DRY_RUN — preview for ${recipient}:\n${preview}`);
     return;
   }
   try {
@@ -62,6 +65,49 @@ export async function postMessage(
   } catch (err) {
     console.error(`Failed to send to ${recipient}:`, err);
   }
+}
+
+// Plain-text approximation of a message for DRY_RUN. Slack shows a table at
+// the bottom of the message wherever it sits in `blocks`, so it goes last
+// here too.
+function previewBlocks(blocks: Array<Record<string, any>>): string {
+  const isTable = (b: Record<string, any>) => b.type === "table";
+  return [...blocks.filter((b) => !isTable(b)), ...blocks.filter(isTable)]
+    .map((b) => {
+      switch (b.type) {
+        case "section":
+          return b.text.text;
+        case "actions":
+          return b.elements.map((e: any) => `[ ${e.text.text} ]`).join(" ");
+        case "table":
+          return previewTable(b);
+        default:
+          return JSON.stringify(b);
+      }
+    })
+    .join("\n\n");
+}
+
+// Cells are the two shapes headerCell and textCell build.
+function previewTable({ rows, column_settings = [] }: Record<string, any>) {
+  const cells: string[][] = rows.map((row: any[]) =>
+    row.map((c) => (c.text ?? c.elements[0].elements[0].text).trim()),
+  );
+  const widths = cells[0].map((_, i) =>
+    Math.max(...cells.map((r) => r[i].length)),
+  );
+  return cells
+    .map((r) =>
+      r
+        .map((c, i) =>
+          column_settings[i]?.align === "right"
+            ? c.padStart(widths[i])
+            : c.padEnd(widths[i]),
+        )
+        .join(" │ ")
+        .trimEnd(),
+    )
+    .join("\n");
 }
 
 export async function sendDm(
